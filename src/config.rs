@@ -1992,7 +1992,10 @@ fn model_supports_tool_search(model: &str) -> bool {
     }
     // Codex catalog gpt-6 slugs (`supports_search_tool: true`), matched
     // exactly: the catalog lists no gpt-6 family, only these slugs.
-    matches!(model, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+    matches!(
+        model,
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+    )
 }
 
 /// Whether `host` belongs to xAI (`x.ai` or any subdomain). Used both to gate
@@ -10921,7 +10924,9 @@ target = "judge-alias"
         // Codex catalog slug `gpt-6-astra` (`supports_search_tool: true`).
         assert!(config.native_tool_search("codex", "gpt-6-astra"));
         assert!(config.native_tool_search("openai", "gpt-6-astra"));
-        // Codex catalog slugs `gpt-6-sol` and `gpt-6-luna` (same flag).
+        // Codex catalog slugs `gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`
+        // (same flag).
+        assert!(config.native_tool_search("codex", "gpt-6.1-sol"));
         assert!(config.native_tool_search("codex", "gpt-6-sol"));
         assert!(config.native_tool_search("codex", "gpt-6-luna"));
         for model in [
@@ -10931,6 +10936,8 @@ target = "judge-alias"
             "not-gpt-6-astra",
             "gpt-6-sol-preview",
             "gpt-6-luna[1m]",
+            "gpt-6.1-sol[1m]",
+            "gpt-6.1-sol-preview",
         ] {
             assert!(!config.native_tool_search("codex", model), "{model}");
         }
@@ -10950,6 +10957,8 @@ target = "judge-alias"
         assert!(!config.native_tool_search("codex", "gpt-6-terra"));
         assert!(!config.native_tool_search("codex", "gpt-6"));
         assert!(!config.native_tool_search("codex", "gpt-6-astral"));
+        assert!(!config.native_tool_search("codex", "gpt-6.1"));
+        assert!(!config.native_tool_search("codex", "gpt-6.1-luna"));
         // Unsupported flavor keeps the shim (xAI), even though `tool_search`
         // auto-resolves to on for a known host — the flavor gate blocks it
         // regardless.
