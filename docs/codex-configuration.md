@@ -271,15 +271,15 @@ to**, and **rejects the `gpt-*-codex` slugs** (e.g. `gpt-5.2-codex`) with a `400
 
 - The authoritative catalog of Codex slugs (and the reasoning levels each accepts) is openai/codex's
   [`codex-rs/models-manager/models.json`](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json).
-- Current listed slugs: **`gpt-6-astra`**, **`gpt-6-sol`**, **`gpt-6-luna`** (latest),
-  **`gpt-5.6-sol`**, **`gpt-5.6-terra`**, **`gpt-5.6-luna`** (frontier), and **`gpt-5.5`** /
+- Current listed slugs: **`gpt-6.1-sol`**, **`gpt-6-astra`**, **`gpt-6-sol`**, **`gpt-6-luna`**
+  (latest), **`gpt-5.6-sol`**, **`gpt-5.6-terra`**, **`gpt-5.6-luna`** (frontier), and **`gpt-5.5`** /
   **`gpt-5.4`** / **`gpt-5.4-mini`** / **`gpt-5.2`**. Older accounts may only be entitled to the
   earlier ones; a **free** account has resolved to `gpt-5.5` in testing.
 - To see what your account can use, look at what the `codex` CLI itself sends, or the live
   `/models` fetch it performs at startup.
 
-> **Client-version gating.** Some slugs carry a `minimal_client_version` (e.g. `gpt-6-astra`
-> needs ≥ 0.153.0; `gpt-6-sol` and `gpt-6-luna` need ≥ 0.155.0). When the request's client
+> **Client-version gating.** Some slugs carry a `minimal_client_version` (e.g. `gpt-6.1-sol` and
+> `gpt-6-astra` need ≥ 0.153.0; `gpt-6-sol` and `gpt-6-luna` need ≥ 0.155.0). When the request's client
 > identity is missing or too old the backend answers
 > **`Model not found <slug>`** — *not* an entitlement error. shunt avoids this by sending the
 > pinned Codex CLI headers (§4.4). See [openai/codex#31967](https://github.com/openai/codex/issues/31967).
@@ -407,8 +407,8 @@ window follows the id automatically, so one global value sizes the mapped subage
 main keeps its own.
 
 The **[`shunt-codex` plugin](../plugins/shunt-codex/)** ships ready-made subagents for
-`gpt-6-sol` / `-luna` and `gpt-5.6-sol` / `-terra` / `-luna` (each pins its `model:` frontmatter
-to the slug), so you can
+`gpt-6.1-sol`, `gpt-6-sol` / `-luna` and `gpt-5.6-sol` / `-terra` / `-luna` (each pins its
+`model:` frontmatter to the slug), so you can
 `@`-mention a Codex model without authoring the agent files yourself.
 
 ### 7.4 Remap the tier aliases (`haiku`/`sonnet`/`opus` → Codex)
