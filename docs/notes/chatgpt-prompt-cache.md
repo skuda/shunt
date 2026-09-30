@@ -23,7 +23,7 @@ After the fix (gpt-5.6-luna, ~59K-token stable system prompt): the cold turn rep
 
 Sessionless requests (no session header, no `metadata.user_id`) send no affinity headers and no key — zero affinity, where every codex session has a root identity (`session.rs:906-913`); the plain-`user_id` hash fallback is per-user, so all of one user's conversations share one cache namespace. Both affect only clients that do not send the Claude Code session header.
 
-A client identity below a slug's `minimal_client_version` gets 400 "The '<slug>' model is not supported when using Codex with a ChatGPT account" — the same message an unentitled slug gets (gpt-6-luna needs ≥ 0.155.0; measured 2026-09-27, the same request seconds apart at identities 0.153.3 and 0.156.0). `GET /backend-api/codex/models?client_version=<v>` lists a slug only once `<v>` reaches that floor, which tells the two causes apart.
+A client identity below a slug's `minimal_client_version` gets 400 "The '<slug>' model is not supported when using Codex with a ChatGPT account" — the same message an unentitled slug gets (gpt-6-luna needs ≥ 0.155.0; measured 2026-09-27, the same request seconds apart at identities 0.153.3 and 0.156.0). `GET /backend-api/codex/models?client_version=<v>` lists a slug only once `<v>` reaches that floor, which tells the two causes apart. The catalog field can lag the backend's floor: `gpt-6.1-sol` carries `minimal_client_version: 0.153.0`, but on 2026-09-30 the listing included it for 0.159.0 and 0.159.2 and omitted it for 0.156.0 and 0.158.0.
 
 ## Codex request parity
 

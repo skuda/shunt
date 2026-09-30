@@ -24,9 +24,9 @@ Each agent's `model:` frontmatter pins the request to a Codex slug, so only that
 subagent diverts — the main session stays on Claude. The three GPT-5.6 agents
 share a 372k-token context window. GPT-6.1-Sol is the latest workhorse for
 coding and everyday work, after GPT-6-Sol; GPT-6-Luna is the fast, affordable
-tier for easier tasks. `gpt-6.1-sol` needs a Codex client of at least 0.153.0,
-`gpt-6-sol` and `gpt-6-luna` at least 0.155.0 — shunt advertises one for you
-(see [Prerequisites](#prerequisites)).
+tier for easier tasks. `gpt-6-sol` and `gpt-6-luna` need a Codex client of at
+least 0.155.0, and `gpt-6.1-sol` needed 0.159.0 when measured on 2026-09-30 —
+shunt advertises a new enough one for you (see [Prerequisites](#prerequisites)).
 
 > **Effort levels are from openai/codex's [`models.json`](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json).**
 > Note the difference: **Luna (both `gpt-6-luna` and `gpt-5.6-luna`) does not
@@ -93,10 +93,11 @@ and is configured to route the model ids above to the Codex provider:
 > The ChatGPT-account backend only accepts the slugs your account is entitled to.
 > The latest are `gpt-6.1-sol` / `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna`,
 > followed by `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`; older accounts may
-> only have `gpt-5.5` / `gpt-5.4` / `gpt-5.2`. `gpt-6.1-sol` and `gpt-6-astra`
-> require a Codex client of at least 0.153.0, `gpt-6-sol` and `gpt-6-luna` at
-> least 0.155.0; shunt's pinned client identity (`codex_cli_rs/0.156.0`)
-> satisfies each. The canonical catalog is
+> only have `gpt-5.5` / `gpt-5.4` / `gpt-5.2`. `gpt-6-astra` requires a Codex
+> client of at least 0.153.0, and `gpt-6-sol` and `gpt-6-luna` at least 0.155.0.
+> `gpt-6.1-sol` lists 0.153.0 in the catalog, but on 2026-09-30 the backend
+> listed it for client 0.159.0 and not for 0.158.0. shunt's pinned client
+> identity (`codex_cli_rs/0.159.2`) is new enough for all four. The canonical catalog is
 > openai/codex's [`models.json`](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json).
 
 Without a running shunt gateway mapping these ids, Claude Code will send the
