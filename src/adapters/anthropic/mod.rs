@@ -1066,6 +1066,11 @@ async fn relay_response(
     account_name: Option<&str>,
     bounds: crate::adapters::ResponseBounds,
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
+    let upstream = crate::response_coding::normalize(upstream);
+    let coding = upstream
+        .extensions()
+        .get::<crate::response_coding::UpstreamCoding>()
+        .copied();
     let status = upstream.status();
     let response_headers = headers::filtered(upstream.headers());
     let is_sse = upstream
@@ -1080,11 +1085,12 @@ async fn relay_response(
     // outbound, and the upstream — possibly several hops away — reports its own
     // model id back in `message_start` / the JSON body. Without this the raw id
     // leaks to Claude Code and breaks `--resume` model restoration (issue #172).
-    // When alias == upstream_model there is nothing to restore: `None` keeps the
-    // body byte-for-byte, preserving passthrough for api.anthropic.com routes.
     let alias = (route.model != route.upstream_model).then(|| route.model.clone());
 
     let mut builder = Response::builder().status(status);
+    if let Some(coding) = coding {
+        builder = builder.extension(coding);
+    }
     for (name, value) in response_headers {
         if let Some(name) = name {
             builder = builder.header(name, value);
@@ -1288,6 +1294,7 @@ fn rewrite_account_uuid(body: Vec<u8>, account_uuid: Option<&str>) -> Vec<u8> {
 /// stripped and replaced with the provider's key in its configured header.
 fn outbound_headers(headers: &HeaderMap, credential: &Credential) -> HeaderMap {
     let mut out = headers::filtered(headers);
+    crate::response_coding::filter_accept_encoding(&mut out);
     match credential {
         Credential::ApiKey { value, header } => {
             out.remove("authorization");
@@ -1536,6 +1543,7 @@ pub(crate) async fn chain_attempt(
             };
         }
     };
+    let upstream = crate::response_coding::normalize(upstream);
     let status = upstream.status();
     if !status.is_success() {
         // The single-route path relays a non-2xx upstream response as the HTTP
