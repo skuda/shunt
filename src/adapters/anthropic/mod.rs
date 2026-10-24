@@ -1220,8 +1220,8 @@ async fn relay_response(
     let alias = (route.model != route.upstream_model).then(|| route.model.clone());
     // Wrap a third-party upstream's thinking signatures so a later turn routed
     // to Anthropic drops them instead of failing on them (issue #783). `None`
-    // for first-party and `claude_oauth` providers, whose bodies stay
-    // byte-for-byte passthrough. Only a successful JSON (or untyped) body is
+    // for first-party and `claude_oauth` providers, whose bodies are not
+    // wrapped. Only a successful JSON (or untyped) body is
     // read whole to be rewritten: an error body, or one declared as any other
     // type, carries no thinking block, so it keeps streaming through.
     let signing_key = state

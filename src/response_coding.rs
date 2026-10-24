@@ -41,8 +41,8 @@ impl UpstreamCoding {
 
 /// Keep supported offers and identity exclusions in client order. Without a
 /// supported coding, ask for identity even when the client excludes it: a reply
-/// in a coding shunt cannot decode would bypass the plaintext layers, the spend
-/// meter among them.
+/// in a coding shunt cannot decode would reach the plaintext layers, the spend
+/// meter among them, still encoded.
 pub(crate) fn filter_accept_encoding(headers: &mut HeaderMap) {
     let mut has_coding = false;
     let mut offers = Vec::new();

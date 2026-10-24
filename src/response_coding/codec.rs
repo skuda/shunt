@@ -7,6 +7,11 @@ use super::UpstreamCoding;
 
 pub(super) const PIECE_BYTES: usize = 16 * 1024;
 
+/// RFC 9659 §3: an encoder of the "zstd" content coding MUST NOT require a
+/// window above 8 MB, and §4 has decoders fail on frames that do. libzstd's own default limit is
+/// 128 MiB, which would let one upstream reply hold that much history.
+const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
 pub(super) enum Step {
     Output(Bytes),
     Input,
@@ -47,7 +52,11 @@ impl Decoder {
                 DecodeKind::Deflate(flate2::Decompress::new(true), Input::default(), false)
             }
             UpstreamCoding::Zstd => {
-                DecodeKind::Zstd(zstd::stream::raw::Decoder::new()?, Input::default(), false)
+                let mut decoder = zstd::stream::raw::Decoder::new()?;
+                decoder.set_parameter(zstd::stream::raw::DParameter::WindowLogMax(
+                    ZSTD_WINDOW_LOG_MAX,
+                ))?;
+                DecodeKind::Zstd(decoder, Input::default(), false)
             }
         }))
     }

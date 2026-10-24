@@ -24,8 +24,8 @@
 //! the round trip holds across reloads and sticky-binding expiry alike.
 //!
 //! **Which responses are wrapped** is [`signing_key`]'s call: not a
-//! `claude_oauth` pool and not `api.anthropic.com`. First-party responses stay
-//! byte-for-byte passthrough, which is what Anthropic's own signatures need.
+//! `claude_oauth` pool and not `api.anthropic.com`. First-party responses are
+//! not wrapped, which is what Anthropic's own signatures need.
 //!
 //! **Streaming.** A client concatenates a thinking block's
 //! `content_block_start.content_block.signature` and every `signature_delta`

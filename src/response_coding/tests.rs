@@ -182,6 +182,30 @@ async fn invalid_and_truncated_bodies_error_without_panicking() {
 }
 
 #[tokio::test]
+async fn zstd_frames_needing_more_than_an_8_mib_window_fail() {
+    use std::io::Write as _;
+    let frame = |window_log: u32| {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder
+            .set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
+            .unwrap();
+        encoder
+            .write_all(b"event: message_start\ndata: {}\n\n")
+            .unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    };
+    for (window_log, decodes) in [(23, true), (24, false)] {
+        let bytes = frame(window_log);
+        let input = stream::once(async { Ok::<_, Infallible>(bytes) });
+        assert_eq!(
+            collected(decode(input, UpstreamCoding::Zstd)).await.is_ok(),
+            decodes,
+            "window log {window_log}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn upstream_body_errors_propagate() {
     let input = stream::iter([Err::<Bytes, _>(io::Error::other("upstream body failed"))]);
     let error = collected(decode(input, UpstreamCoding::Gzip))
