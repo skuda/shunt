@@ -302,12 +302,14 @@ fn accept_encoding_keeps_order_and_quality_values() {
         headers[header::ACCEPT_ENCODING],
         "gzip;q=0, zstd;q=0.7, deflate;q=0, GZIP;q=1"
     );
-    for value in ["identity", "br", "unknown, br", "*", "gzip;q=0"] {
-        headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(value));
-        filter_accept_encoding(&mut headers);
-        assert_eq!(headers[header::ACCEPT_ENCODING], "identity");
-    }
+    // Without a supported coding the upstream is asked for identity, even when
+    // the client excludes it.
     for value in [
+        "identity",
+        "br",
+        "unknown, br",
+        "*",
+        "gzip;q=0",
         "br, identity;q=0",
         "br, *;q=0",
         "br, gzip;q=0, identity;q=0",
@@ -317,7 +319,7 @@ fn accept_encoding_keeps_order_and_quality_values() {
     ] {
         headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(value));
         filter_accept_encoding(&mut headers);
-        assert_eq!(headers[header::ACCEPT_ENCODING], value);
+        assert_eq!(headers[header::ACCEPT_ENCODING], "identity", "{value}");
     }
     headers.insert(
         header::ACCEPT_ENCODING,

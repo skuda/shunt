@@ -94,10 +94,12 @@ still fails as truncated input.
 
 The outbound offer retains gzip, deflate, zstd, identity entries, and `*;q=0`
 exclusions in client order with their parameters. With no acceptable supported
-coding, shunt sends an explicit identity offer. If the client excludes identity in
-that case, shunt preserves its original offer for the existing passthrough
-path. A third-party upstream whose thinking signatures shunt wraps gets
-`identity` instead (`thinking_wrap::request_identity_encoding`). Unsupported or stacked response codings stay on that path. Codec steps
+coding, shunt sends an explicit identity offer, also when the client excludes
+identity: a reply in a coding shunt cannot decode would bypass the plaintext
+layers and the spend meter. A third-party upstream whose thinking signatures
+shunt wraps gets `identity` instead
+(`thinking_wrap::request_identity_encoding`). A response in an unsupported or
+stacked coding stays on the passthrough path. Codec steps
 run under bounded blocking-pool admission and emit decoded pieces of at most
 16 KiB. `Decoder` uses flate2's gzip wrapper and drains pending output before
 requesting more input. At a member boundary, it starts a fresh gzip decoder

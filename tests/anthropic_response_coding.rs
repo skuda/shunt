@@ -209,25 +209,19 @@ async fn outbound_offers_drop_brotli_and_keep_supported_quality_values() {
 }
 
 #[tokio::test]
-async fn upstream_negotiation_respects_identity_and_unsupported_exclusions() {
+async fn upstream_negotiation_asks_for_identity_without_a_supported_coding() {
     let mut env = common::env_lock().await;
     env.set(POOL_TOKEN_ENV, "fake-oauth-token");
+    // The mock answers a `br` offer in `br`, which shunt cannot decode, so a
+    // forwarded `br` offer would fail the `content-encoding` check below.
     for (offer, expected_offer, expected_coding) in [
         (Some("gzip"), "gzip", Some("gzip")),
         (Some("identity"), "identity", None),
         (Some("br"), "identity", None),
         (None, "identity", None),
-        (Some("br, identity;q=0"), "br, identity;q=0", Some("br")),
-        (
-            Some("br, gzip;q=0, identity;q=0"),
-            "br, gzip;q=0, identity;q=0",
-            Some("br"),
-        ),
-        (
-            Some("br, gzip;q=0, *;q=0"),
-            "br, gzip;q=0, *;q=0",
-            Some("br"),
-        ),
+        (Some("br, identity;q=0"), "identity", None),
+        (Some("br, gzip;q=0, identity;q=0"), "identity", None),
+        (Some("br, gzip;q=0, *;q=0"), "identity", None),
     ] {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -270,7 +264,6 @@ async fn upstream_negotiation_respects_identity_and_unsupported_exclusions() {
         let bytes = response.bytes().await.unwrap();
         match expected_coding {
             Some("gzip") => assert_eq!(decoded("gzip", &bytes), "{}"),
-            Some("br") => assert_eq!(bytes, "opaque br bytes"),
             None => assert_eq!(bytes, "{}"),
             _ => unreachable!(),
         }

@@ -39,11 +39,11 @@ impl UpstreamCoding {
     }
 }
 
-/// Keep supported offers and identity exclusions in client order. Fall back to
-/// explicit identity unless the client excludes it and offers no supported coding.
+/// Keep supported offers and identity exclusions in client order. Without a
+/// supported coding, ask for identity even when the client excludes it: a reply
+/// in a coding shunt cannot decode would bypass the plaintext layers, the spend
+/// meter among them.
 pub(crate) fn filter_accept_encoding(headers: &mut HeaderMap) {
-    let mut identity = None;
-    let mut wildcard_excludes_identity = false;
     let mut has_coding = false;
     let mut offers = Vec::new();
     for offer in headers
@@ -64,17 +64,9 @@ pub(crate) fn filter_accept_encoding(headers: &mut HeaderMap) {
         let is_identity = token.eq_ignore_ascii_case("identity");
         let wildcard_exclusion = token == "*" && quality == 0.0;
         has_coding |= supported && quality > 0.0;
-        if is_identity {
-            identity = Some(quality > 0.0);
-        }
-        wildcard_excludes_identity |= wildcard_exclusion;
         if supported || is_identity || wildcard_exclusion {
             offers.push(offer.to_owned());
         }
-    }
-    if !has_coding && !identity.unwrap_or(!wildcard_excludes_identity) {
-        // Preserve the original offer for the unsupported-coding passthrough path.
-        return;
     }
     let value = if has_coding {
         HeaderValue::from_str(&offers.join(", ")).expect("filtered header entries remain valid")
