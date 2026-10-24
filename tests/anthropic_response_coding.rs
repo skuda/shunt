@@ -176,7 +176,8 @@ async fn compressed_native_verdict_is_preserved() {
 
 #[tokio::test]
 async fn outbound_offers_drop_brotli_and_keep_supported_quality_values() {
-    let _env = common::env_lock().await;
+    let mut env = common::env_lock().await;
+    env.set(POOL_TOKEN_ENV, "fake-oauth-token");
     for (offer, expected) in [
         (
             "gzip, deflate;q=0.5, br, zstd;q=0.7",
@@ -191,7 +192,7 @@ async fn outbound_offers_drop_brotli_and_keep_supported_quality_values() {
             .expect(1)
             .mount(&upstream)
             .await;
-        let gateway = gateway(config(upstream.uri(), false)).await;
+        let gateway = gateway(pool_config(upstream.uri())).await;
         let response = request(&gateway, offer, false, false, false).await;
         assert!(!response.headers().contains_key("content-encoding"));
         assert_eq!(response.text().await.unwrap(), "{}");
@@ -209,7 +210,8 @@ async fn outbound_offers_drop_brotli_and_keep_supported_quality_values() {
 
 #[tokio::test]
 async fn upstream_negotiation_respects_identity_and_unsupported_exclusions() {
-    let _env = common::env_lock().await;
+    let mut env = common::env_lock().await;
+    env.set(POOL_TOKEN_ENV, "fake-oauth-token");
     for (offer, expected_offer, expected_coding) in [
         (Some("gzip"), "gzip", Some("gzip")),
         (Some("identity"), "identity", None),
@@ -250,7 +252,7 @@ async fn upstream_negotiation_respects_identity_and_unsupported_exclusions() {
             .expect(1)
             .mount(&upstream)
             .await;
-        let gateway = gateway(config(upstream.uri(), false)).await;
+        let gateway = gateway(pool_config(upstream.uri())).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut request = client.post(format!("{}/v1/messages", gateway.url))
             .json(&json!({"model":"native","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}));
@@ -339,6 +341,31 @@ async fn compressed_refusal_keeps_status_retry_after_and_error_envelope() {
     assert_eq!(response.status(), 429);
     assert_eq!(response.headers()["retry-after"], "17");
     assert_eq!(response.headers()["request-id"], "req_refusal");
+    assert_eq!(
+        decoded("gzip", &response.bytes().await.unwrap()).as_bytes(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn compressed_400_keeps_the_client_coding_after_the_refusal_read() {
+    let _env = common::env_lock().await;
+    let body =
+        br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-encoding", "gzip")
+                .set_body_raw(compressed("gzip", body), "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let gateway = gateway(config(upstream.uri(), false)).await;
+    let response = request(&gateway, "gzip", false, false, false).await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
     assert_eq!(
         decoded("gzip", &response.bytes().await.unwrap()).as_bytes(),
         body

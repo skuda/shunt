@@ -81,9 +81,9 @@ safeguard field and beta to `api.anthropic.com`. Verdicts arrived on
 pass leaves a present `safeguard_results` unchanged.
 
 **Response coding.** `response_coding::normalize` incrementally decodes native
-Anthropic gzip, zlib-wrapped deflate, and zstd responses before model alias
-rewriting, keepalive insertion, safeguard synthesis, metrics, and internal
-routing collectors. `proxy::post` re-encodes a marked client response with the
+Anthropic gzip, zlib-wrapped deflate, and zstd responses before the
+account-refusal judge, model alias rewriting, keepalive insertion, safeguard
+synthesis, metrics and spend metering, and internal routing collectors. `proxy::post` re-encodes a marked client response with the
 upstream's coding and flushes after each plaintext piece. This prevents a
 compressed SSE body from waiting in a plaintext frame accumulator. Internal
 judge and gated calls consume the decoded body. Gated replay retains the coding
@@ -96,7 +96,8 @@ The outbound offer retains gzip, deflate, zstd, identity entries, and `*;q=0`
 exclusions in client order with their parameters. With no acceptable supported
 coding, shunt sends an explicit identity offer. If the client excludes identity in
 that case, shunt preserves its original offer for the existing passthrough
-path. Unsupported or stacked response codings stay on that path. Codec steps
+path. A third-party upstream whose thinking signatures shunt wraps gets
+`identity` instead (`thinking_wrap::request_identity_encoding`). Unsupported or stacked response codings stay on that path. Codec steps
 run under bounded blocking-pool admission and emit decoded pieces of at most
 16 KiB. `Decoder` uses flate2's gzip wrapper and drains pending output before
 requesting more input. At a member boundary, it starts a fresh gzip decoder

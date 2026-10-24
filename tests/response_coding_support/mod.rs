@@ -143,6 +143,23 @@ pub fn config(url: String, alias: bool) -> Config {
     config
 }
 
+/// The token env var of [`pool_config`]'s one account.
+pub const POOL_TOKEN_ENV: &str = "SHUNT_TEST_RESPONSE_CODING_POOL";
+
+/// [`config`] with the upstream as a one-account `claude_oauth` pool, whose
+/// requests carry the client's filtered `Accept-Encoding` offer.
+pub fn pool_config(url: String) -> Config {
+    let mut config = config(url, false);
+    config.upstreams[0].auth = Some(
+        serde_json::from_value(json!({
+            "mode": "claude_oauth",
+            "accounts": [{"name": "pool", "token_env": POOL_TOKEN_ENV, "uuid": "uuid-pool"}]
+        }))
+        .unwrap(),
+    );
+    config
+}
+
 pub async fn gateway(config: Config) -> Server {
     let (app, _, _) = server::build_router(config).unwrap();
     serve(app).await
