@@ -79,6 +79,29 @@ literal path the real ChatGPT backend uses), a base ending in `/v1` produces `/v
 a bare base produces `/responses`. Registering all three lets an operator use either CLI setup
 style (§ "Codex CLI setup" below) without shunt needing to know which one a given client chose.
 
+### Web search relay
+
+The Codex CLI runs its built-in web search tool (`web.run`: `search_query`, `open`, and the other
+commands) by posting to `<base_url>/alpha/search`, so the same opt-in registers one search route
+per base-URL form:
+
+| Method | Path |
+| :-- | :-- |
+| `POST` | `/backend-api/codex/alpha/search` |
+| `POST` | `/alpha/search` |
+| `POST` | `/v1/alpha/search` |
+
+They share the Responses routes' handler pipeline — `[server.auth]`, the request body limit, the
+session-sticky pool key, account selection, failover, refresh, and the OpenAI-shaped gateway errors
+(`concurrency::is_codex_path` classifies them too) — and relay the body and the upstream reply
+verbatim to `<base_url>/codex/alpha/search` (`<base_url>/alpha/search` for a non-ChatGPT base),
+selected by `adapters::responses::CodexOperation`. Two things differ from a turn. A search is not a
+model turn, so `[[server.codex_endpoint.routes]]` never applies: it always goes to
+`[server.codex_endpoint].provider`, and it is labeled `web_search` in metrics but selects its
+account without a model, so no per-model cooldown can block it. And the operation has no WebSocket
+form, so only `POST` is registered. Before these routes existed, every web search from a Codex CLI
+pointed at shunt failed with an empty `404`.
+
 In addition, shunt registers dedicated Codex model discovery routes:
 
 | Method | Path |
@@ -175,7 +198,9 @@ narrower path:
   never runs on the async executor.
 - **One credential, no pool, no failover.** shunt resolves the routed provider's single credential
   (`api_key` from its `api_key_env`, or an OAuth bearer) and sends exactly one request. There is no
-  account rotation to fall back to.
+  account rotation to fall back to. For an `xai_oauth` route whose account pool is non-empty, that
+  credential is the first account in pool selection order (the provider's `account`/`accounts`
+  scope honored); an empty pool uses `~/.shunt/xai-auth.json` ([M18](m18-xai-multi-account.md)).
 - **Verbatim relay.** The upstream response is relayed unchanged — status, body, and headers,
   including `retry-after` on a 429 — so the Codex CLI backs off against the third party's real
   signal instead of a rotation shunt invented. A 429 or 5xx is *not* a failover trigger here.
@@ -333,11 +358,68 @@ configured provider sets the outbound `websocket = true`
   failures arrive as standalone `type: "error"` frames carrying only safe response metadata.
   Failures before the upgrade (missing client token, a handshake without valid upgrade headers,
   an endpoint disabled by reload) return the OpenAI Responses error shape over HTTP.
+  An incremental `response.create` frame (`previous_response_id` plus only the new input) is
+  expanded against the connection's own transcript — the previous turn's full input plus the
+  output items of its completed response — because the ChatGPT HTTP backend rejects
+  `previous_response_id`; the id is stripped only for turns served by a ChatGPT backend, and a
+  frame whose input already carries the whole history is forwarded without expansion. An id that
+  does not name this connection's last completed response is dropped and the input forwarded as
+  sent: without a transcript shunt cannot tell a delta from a full history, so a client that sends
+  only a delta then loses the earlier context (e.g. after a reconnect) — resend the full history
+  on a new connection. A turn routed by `[[server.codex_endpoint.routes]]` to a non-ChatGPT
+  provider receives the frame unchanged, `previous_response_id` included, when that provider
+  issued the id (or shunt does not know it); an id issued by a different backend on the same
+  connection cannot resolve there, so it is stripped and the delta expanded instead.
 
 Without `[server.auth]`, a browser-originated upgrade is admitted only when its `Origin` matches
 the `Host` header. That check cannot tell `http` from `https` on the same host — shunt does not
 see the client-facing scheme when TLS terminates at a proxy — so gate the endpoint with
 `[server.auth]` for anything beyond loopback.
+
+## Spend limits
+
+With `[server.spend]` configured, the endpoint enforces and meters the same per-principal caps as
+`/v1/messages` ([Gateway spend limits](gateway-spend-limits.md), issue #733). Without it, nothing
+here applies.
+
+- **Checked before any upstream call.** Every turn is assessed first, on the HTTP `POST` of all
+  three Responses paths and on the Responses WebSocket. The principal is the one `/v1/messages`
+  uses: the static `[server.auth]` token name, the verified JWT email, or `shunt:anonymous` without
+  `[server.auth]`. This endpoint does not accept gateway-login sessions.
+- **HTTP refusal.** An over-cap turn gets `429` with
+  `{"error":{"message":…,"type":"usage_limit_reached","code":"usage_limit_reached","resets_at":<epoch s>}}`
+  and the headers `retry-after`, `x-should-retry: false` and `x-codex-promo-message: <blocked_message>`.
+  The promo header is sent only when `blocked_message` is plain ASCII; the text always rides in the
+  message. The refusal is built by the endpoint itself, not by the generic OpenAI error shaping,
+  which would drop `code`, `resets_at` and the promo header. The named cap is the reached cap that
+  resets last.
+- **Fail-closed.** With `fail_closed_on_error`, a capped principal whose spend state is unavailable
+  is refused with the same `usage_limit_reached` type and the message `spend limit unavailable`, with
+  no `resets_at` and no `retry-after`.
+- **What the Codex CLI shows.** At the pinned version `rust-v0.159.3`, a `429` with
+  `usage_limit_reached` becomes the CLI's usage-limit error, which it does not retry. The CLI
+  renders its own "You've hit your usage limit … Try again at <resets_at>" text, with the promo
+  message when the header is present, and ignores the server message.
+- **WebSocket.** A refused `response.create` gets one frame,
+  `{"type":"error","status":429,"error":{…as above…},"headers":{"retry-after":…,"x-codex-promo-message":…}}`.
+  The socket stays open and each later turn is assessed afresh. A `generate: false` warmup makes no
+  upstream call and is not checked.
+- **Web search.** `/alpha/search` and its aliases are refused with the same error when over cap, and
+  are never metered.
+- **Metering.** A completed turn is billed from the Responses `usage` into the counters
+  `/v1/messages` writes, so one cap bounds both surfaces. Cached tokens are billed at the cache-read
+  rate and the rest of the input at the input rate; reasoning is inside output; there is no cache
+  write. Pricing is keyed by the serving provider, the client model and the upstream model.
+- **GPT pricing.** The built-in catalog has no GPT or Codex prices, so those models bill at the
+  unknown-model rate unless the operator adds `[[server.spend.pricing.overrides]]` rows (an example
+  is in [Gateway spend limits](gateway-spend-limits.md#inbound-codex-endpoint-metering)). Rows for
+  the endpoint's provider or its routes are not flagged as unreachable.
+- **Floor.** A turn that ends without reported usage (client close, replaced turn, broken stream)
+  is billed the input estimated from the request body plus the output text already delivered.
+- **Non-streamed bodies.** A non-streamed 2xx JSON Responses body is billed from its `usage` with the
+  same cached split. One that reports no input (no readable `usage`, a cut body, or a body over 4 MiB)
+  bills the input estimated from the request body instead, alongside the output floor. A body the
+  client drops before its first byte is polled is not billed, as on `/v1/messages`.
 
 ## Reload behavior
 

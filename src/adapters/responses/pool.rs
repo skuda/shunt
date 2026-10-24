@@ -1,6 +1,8 @@
 //! Codex/ChatGPT OAuth account-pool failover (M10): try each account in turn,
 //! websocket-first when enabled with an HTTP fallback per account, classifying
 //! each raw upstream status to decide relay / rotate / refresh-and-retry.
+//! The same loop serves the xAI pool (`StoreFamily::Xai`, docs/m18), with
+//! per-family resolution and classification.
 
 use std::{
     path::PathBuf,
@@ -34,6 +36,7 @@ use super::error::{
 };
 use super::http::{http_send, json_response, stream_response};
 use super::websocket::forward_websocket;
+use crate::adapters::buffer_error_body;
 use crate::proxy::chain_stream::LazyEnvelope;
 
 #[cfg(test)]
@@ -134,6 +137,9 @@ pub(super) struct PoolStreamContext {
     /// it — the committed pool's account scan ran inside this stream — else
     /// the first poll of the account loop.
     pub(super) started_at: Option<std::time::Instant>,
+    /// The turn's `client_kind`/`managed` attribution, for the sample this
+    /// stream takes when it owns it (`record_metrics`).
+    pub(super) attribution: crate::client_attribution::ClientAttribution,
 }
 
 /// One streaming pool turn's event feed: the account loop (admission,
@@ -207,8 +213,9 @@ pub(super) async fn forward_chatgpt_oauth_stream(
         compact: compact.clone(),
         delegation: delegation.clone(),
         upstream_body: upstream_body.clone(),
-        auth: AuthMode::ChatgptOauth,
+        auth: provider_auth(&state, &route),
         codex_quota_account: None,
+        attribution: turn.attribution,
     };
     let events = pool_or_single_events(
         scan,
@@ -305,6 +312,7 @@ pub(super) fn pool_or_single_events(
                             crate::metrics::record_proxied_request(
                                 &route.provider,
                                 &route.model,
+                                single.attribution,
                                 StatusCode::BAD_GATEWAY.as_u16(),
                                 attempt_started.elapsed().as_secs_f64() * 1000.0,
                             );
@@ -316,6 +324,7 @@ pub(super) fn pool_or_single_events(
                         crate::metrics::record_proxied_request(
                             &route.provider,
                             &route.model,
+                            single.attribution,
                             StatusCode::BAD_GATEWAY.as_u16(),
                             attempt_started.elapsed().as_secs_f64() * 1000.0,
                         );
@@ -350,7 +359,7 @@ pub(super) fn pool_or_single_events(
                         Box::pin(pool_events_stream(PoolStreamContext {
                             state,
                             route,
-                            auth: AuthMode::ChatgptOauth,
+                            auth: single.auth,
                             session_id,
                             window_key,
                             compact,
@@ -363,6 +372,7 @@ pub(super) fn pool_or_single_events(
                             ramp_initial,
                             record_metrics: true,
                             started_at: Some(attempt_started),
+                            attribution: single.attribution,
                         }))
                     };
                     inner.next().await.map(|item| (item, Phase::Inner(inner)))
@@ -405,6 +415,7 @@ pub(super) fn pool_events_stream(
         ramp_initial,
         record_metrics,
         started_at,
+        attribution,
     } = context;
     type Parsed = std::pin::Pin<Box<dyn Stream<Item = Result<ResponseEvent, Value>> + Send>>;
     enum Phase {
@@ -522,6 +533,7 @@ pub(super) fn pool_events_stream(
                                     crate::metrics::record_proxied_request(
                                         &route.provider,
                                         &route.model,
+                                        attribution,
                                         status.as_u16(),
                                         started.elapsed().as_secs_f64() * 1000.0,
                                     );
@@ -593,8 +605,7 @@ pub(super) fn pool_events_stream(
                                             false,
                                             LazyEnvelope::Ready(
                                                 adapter_error_envelope(transport_error(
-                                                    "all Codex OAuth accounts failed before receiving an upstream response"
-                                                        .to_string(),
+                                                    no_upstream_response_message(auth).to_string(),
                                                 ))
                                                 .await,
                                             ),
@@ -1030,7 +1041,7 @@ pub(super) async fn forward_chatgpt_oauth(
         let events = pool_events_stream(PoolStreamContext {
             state: state.clone(),
             route: route.clone(),
-            auth: AuthMode::ChatgptOauth,
+            auth: provider_auth(&state, &route),
             session_id,
             window_key: pool_key.clone(),
             compact: compact.clone(),
@@ -1043,6 +1054,7 @@ pub(super) async fn forward_chatgpt_oauth(
             ramp_initial: state.config.storm_ramp_initial(),
             record_metrics: true,
             started_at: None,
+            attribution: turn.attribution,
         });
         return Ok((
             StatusCode::OK,
@@ -1071,7 +1083,7 @@ pub(super) async fn forward_chatgpt_oauth(
             state.config.server.pool.as_ref(),
         )
     };
-    let auth = AuthMode::ChatgptOauth;
+    let auth = provider_auth(&state, &route);
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
     let mut last_response: Option<reqwest::Response> = None;
@@ -1431,9 +1443,29 @@ async fn exhausted_error(
             let clock = idle.map(|idle| (idle, tokio::time::Instant::now()));
             mapped_upstream_error_within(status, upstream, auth, clock).await
         }
-        None => transport_error(
-            "all Codex OAuth accounts failed before receiving an upstream response".to_string(),
-        ),
+        None => transport_error(no_upstream_response_message(auth).to_string()),
+    }
+}
+
+/// The pooled provider's auth mode — `chatgpt_oauth`, or `xai_oauth` since the
+/// xAI pool rides this loop (docs/m18-xai-multi-account.md) — read the way
+/// `forward` reads it. It only picks gateway-owned error wording
+/// ([`mapped_upstream_error`], [`no_upstream_response_message`]); credential
+/// resolution and classification key on each account's `store_family`.
+fn provider_auth(state: &AppState, route: &Route) -> AuthMode {
+    state
+        .config
+        .provider(&route.provider)
+        .map(|provider| provider.auth)
+        .unwrap_or(AuthMode::ChatgptOauth)
+}
+
+/// The gateway-owned message when every pool account failed before any
+/// upstream response, named for the pool's family.
+pub(super) fn no_upstream_response_message(auth: AuthMode) -> &'static str {
+    match auth {
+        AuthMode::XaiOauth => "all xAI OAuth accounts failed before receiving an upstream response",
+        _ => "all Codex OAuth accounts failed before receiving an upstream response",
     }
 }
 
@@ -1576,6 +1608,9 @@ pub(super) async fn resolve_or_cooldown(
     route: &Route,
     account: &AccountConfig,
 ) -> Option<Credential> {
+    if account.store_family == Some(accounts::StoreFamily::Xai) {
+        return resolve_xai_or_cooldown(state, route, account).await.ok();
+    }
     match resolve_chatgpt_account(account, &state.http_client).await {
         Ok(credential) => Some(credential),
         Err(error) => {
@@ -1600,6 +1635,38 @@ pub(super) async fn resolve_or_cooldown(
                 "failed to resolve ChatGPT OAuth account"
             );
             None
+        }
+    }
+}
+
+/// [`resolve_or_cooldown`] for an xAI pool account (`StoreFamily::Xai`):
+/// resolve through [`auth::resolve_xai_account`], and on failure cool the
+/// account down for 5 minutes and rotate — the Kimi pool's treatment
+/// (`adapters::anthropic::forward_kimi_oauth`). The xAI store reports no
+/// terminal/transient split, so no `needs_relogin` mark is set. The routed
+/// inbound Codex endpoint (`inbound_routed`) skips accounts the same way, and
+/// relays the last error when no account resolves.
+pub(super) async fn resolve_xai_or_cooldown(
+    state: &AppState,
+    route: &Route,
+    account: &AccountConfig,
+) -> Result<Credential, AdapterError> {
+    match auth::resolve_xai_account(account, &state.http_client).await {
+        Ok(credential) => Ok(credential),
+        Err(error) => {
+            state.accounts.cooldown(
+                &route.provider,
+                account,
+                Duration::from_secs(5 * 60),
+                "auth",
+            );
+            tracing::warn!(
+                provider = %route.provider,
+                account = %account.name,
+                error = %error.message,
+                "failed to resolve xAI OAuth account"
+            );
+            Err(error)
         }
     }
 }
@@ -1715,110 +1782,6 @@ pub(super) async fn force_refresh_or_cooldown(
 /// The pool-rotation metric reason [`rotate_on_model_refusal`] records.
 const MODEL_NOT_SUPPORTED: &str = "model_not_supported";
 
-/// Read the head of an upstream error body so it can be checked for a model
-/// refusal. The read is bounded like the Responses adapter's error envelope
-/// read ([`crate::error::ERROR_ENVELOPE_BUDGET`] and
-/// [`crate::error::ERROR_ENVELOPE_BYTES`]), plus the gated idle gap when the
-/// caller has one (`ResponseBounds::idle`, as `json_response` honours it):
-/// `clock` is that gap and the attempt's send, so the first wait is the rest
-/// of the gap the header wait began rather than a fresh one, and each chunk
-/// refreshes it (#704). The
-/// bytes are returned only when the whole body arrived within those bounds: a
-/// body that declares or passes the cap, trips the budget, or breaks is not a
-/// refusal, and is passed on unjudged. Only an idle cut is an error: it is the
-/// caller's bound, carried back to `routing::serve` as its marker. With a
-/// clock, a budget trip before the body sent a byte is that cut too (#710).
-///
-/// What an unjudged body becomes depends on who relays it. `verbatim` (the
-/// inbound passthrough) replays every byte read followed by whatever the
-/// upstream has not sent yet — a declared-oversized body is not read at all —
-/// so the client gets the upstream's 400 exactly as it was sent. Otherwise the
-/// body is the text the envelope read falls back to (`upstream returned
-/// {status}`): the translating path would render that anyway, and handing it
-/// the unread remainder would restart the envelope read's budget, outside the
-/// idle gap, on a body that has already spent both.
-async fn buffer_error_body(
-    upstream: reqwest::Response,
-    clock: Option<(Duration, tokio::time::Instant)>,
-    verbatim: bool,
-) -> Result<(reqwest::Response, Option<bytes::Bytes>), AdapterError> {
-    let declared_oversized = upstream
-        .content_length()
-        .is_some_and(|length| length > crate::error::ERROR_ENVELOPE_BYTES as u64);
-    if declared_oversized && verbatim {
-        return Ok((upstream, None));
-    }
-    let status = upstream.status();
-    let version = upstream.version();
-    let mut headers = upstream.headers().clone();
-    let mut rest = upstream.bytes_stream();
-    let budget = tokio::time::Instant::now() + crate::error::ERROR_ENVELOPE_BUDGET;
-    let mut read = Vec::new();
-    let mut total = 0usize;
-    let mut idle_deadline = clock.map(|(idle, since)| since + idle);
-    let complete = !declared_oversized
-        && loop {
-            let wait = idle_deadline.map_or(budget, |deadline| deadline.min(budget));
-            match tokio::time::timeout_at(wait, rest.next()).await {
-                Ok(None) => break true,
-                Ok(Some(Ok(chunk))) => {
-                    idle_deadline = clock.map(|(idle, _)| tokio::time::Instant::now() + idle);
-                    total = total.saturating_add(chunk.len());
-                    read.push(Ok(chunk));
-                    if total > crate::error::ERROR_ENVELOPE_BYTES {
-                        break false;
-                    }
-                }
-                Ok(Some(Err(error))) => {
-                    read.push(Err(error));
-                    break false;
-                }
-                Err(_) => match (clock, idle_deadline) {
-                    (Some((idle, _)), Some(deadline)) if deadline < budget => {
-                        return Err(crate::adapters::idle_error(
-                            crate::adapters::UpstreamBodyIdle { idle },
-                        ));
-                    }
-                    // The budget ended a body that never sent a byte: on a
-                    // gated call that is a stall too, as
-                    // `bounded_upstream_text_within` cuts it (#710).
-                    (Some(_), _) if total == 0 => {
-                        return Err(crate::adapters::idle_error(
-                            crate::adapters::UpstreamBodyIdle {
-                                idle: crate::error::ERROR_ENVELOPE_BUDGET,
-                            },
-                        ));
-                    }
-                    _ => break false,
-                },
-            }
-        };
-    let (body, judged) = if complete {
-        let mut bytes = bytes::BytesMut::with_capacity(total);
-        for chunk in read.iter().flatten() {
-            bytes.extend_from_slice(chunk);
-        }
-        let bytes = bytes.freeze();
-        (reqwest::Body::from(bytes.clone()), Some(bytes))
-    } else if verbatim {
-        (
-            reqwest::Body::wrap_stream(stream::iter(read).chain(rest)),
-            None,
-        )
-    } else {
-        headers.remove(reqwest::header::CONTENT_LENGTH);
-        (
-            reqwest::Body::from(format!("upstream returned {status}")),
-            None,
-        )
-    };
-    let mut rebuilt = axum::http::Response::new(body);
-    *rebuilt.status_mut() = status;
-    *rebuilt.version_mut() = version;
-    *rebuilt.headers_mut() = headers;
-    Ok((reqwest::Response::from(rebuilt), judged))
-}
-
 /// Check a relay-classified response for the per-account model refusal
 /// ([`accounts::is_codex_model_unsupported`]). Only a 400 has its body read —
 /// every other status passes through untouched, unread. On a match the
@@ -1890,6 +1853,9 @@ pub(super) async fn classify_first(
     clock: Option<(Duration, tokio::time::Instant)>,
     verbatim: bool,
 ) -> Result<FirstOutcome, AdapterError> {
+    if account.store_family == Some(accounts::StoreFamily::Xai) {
+        return Ok(classify_first_xai(state, route, account, upstream));
+    }
     let status = upstream.status();
     match accounts::classify_codex(status, upstream.headers()) {
         FailoverAction::Relay => {
@@ -1919,6 +1885,46 @@ pub(super) async fn classify_first(
         }
         FailoverAction::RefreshRetry => Ok(FirstOutcome::NeedRefresh(upstream)),
         FailoverAction::PauseSame => unreachable!("classify_codex never returns PauseSame"),
+    }
+}
+
+/// [`classify_first`] for an xAI pool account: the same cooldown-and-rotate
+/// bookkeeping, classified with [`accounts::classify_xai`] and without the
+/// Codex-only 400 model-refusal read, so a relayed 4xx keeps its body unread.
+/// `classify_xai` never asks for a refresh retry; the defensive arms rotate.
+fn classify_first_xai(
+    state: &AppState,
+    route: &Route,
+    account: &AccountConfig,
+    upstream: reqwest::Response,
+) -> FirstOutcome {
+    let status = upstream.status();
+    match accounts::classify_xai(status, upstream.headers()) {
+        FailoverAction::Relay => FirstOutcome::Relay(upstream),
+        FailoverAction::Rotate | FailoverAction::RefreshRetry | FailoverAction::PauseSame => {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // A token is only sent while unexpired, so a 401 means xAI
+                // revoked it early: refresh on this account's next use rather
+                // than resend it every cooldown until its `exp`. Not awaited:
+                // the mark lands even if this request is cancelled, and nothing
+                // here waits, so the cooldown below cannot be skipped either.
+                let _ = auth::force_xai_refresh(account);
+            }
+            let cooldown = rotate_cooldown(status, upstream.headers());
+            state.accounts.cooldown(
+                &route.provider,
+                account,
+                cooldown,
+                accounts::rotation_reason(status, upstream.headers()),
+            );
+            tracing::warn!(
+                provider = %route.provider,
+                account = %account.name,
+                status = %status,
+                "xAI pool account failed over; cooling down and rotating to the next account"
+            );
+            FirstOutcome::Rotate(upstream)
+        }
     }
 }
 
@@ -2000,6 +2006,7 @@ pub(super) async fn classify_retry(
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)] // Intentional cross-module test serialization.
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2016,10 +2023,6 @@ mod tests {
     use axum::http::StatusCode;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Serializes the env vars the pool-probe tests write; every test in this
-    /// module that calls `std::env::set_var` must hold it for its whole body.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn pool_route() -> Route {
         Route {
@@ -2061,7 +2064,7 @@ mod tests {
         };
         use futures_util::{SinkExt, StreamExt};
 
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _pool_guard = POOL_TEST_LOCK.lock().await;
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
@@ -2193,7 +2196,7 @@ mod tests {
         };
         use futures_util::{SinkExt, StreamExt};
 
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _pool_guard = POOL_TEST_LOCK.lock().await;
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
@@ -2322,7 +2325,7 @@ mod tests {
         };
         use futures_util::{SinkExt, StreamExt};
 
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _pool_guard = POOL_TEST_LOCK.lock().await;
         let _token_b =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_B", probe_token("acc-b"));
@@ -2446,7 +2449,7 @@ mod tests {
         };
         use futures_util::{SinkExt, StreamExt};
 
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _pool_guard = POOL_TEST_LOCK.lock().await;
         let _token_b =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_B", probe_token("acc-b"));
@@ -2582,6 +2585,7 @@ mod tests {
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             accounts_config: accounts,
             turn: TurnOptions {
+                attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
                 client_wants_stream: stream,
                 thinking_enabled: false,
                 tool_search_native: false,
@@ -2598,7 +2602,7 @@ mod tests {
     #[tokio::test]
     async fn pool_streaming_arm_commits_synthetic_start_before_any_upstream_byte() {
         use futures_util::StreamExt;
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let server = MockServer::start().await;
@@ -2638,7 +2642,7 @@ mod tests {
     /// the relayed content flows after it.
     #[tokio::test]
     async fn pool_streaming_arm_rotates_and_relays_from_the_second_account() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let _token_b =
@@ -2691,7 +2695,7 @@ mod tests {
     /// committed stream — never a synthesized completion.
     #[tokio::test]
     async fn pool_streaming_arm_emits_error_event_on_exhaustion() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let server = MockServer::start().await;
@@ -2726,7 +2730,7 @@ mod tests {
     /// error response with the real status, not an early-committed stream.
     #[tokio::test]
     async fn pool_non_streaming_arm_keeps_the_status_relay() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let server = MockServer::start().await;
@@ -2764,7 +2768,7 @@ mod tests {
     /// cooled account-wide, and another model still selects it first.
     #[tokio::test]
     async fn pool_rotates_off_a_model_refusal_and_cools_only_that_model() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let _token_b =
@@ -2836,7 +2840,7 @@ mod tests {
     /// The same rotation on the committed streaming arm.
     #[tokio::test]
     async fn pool_streaming_arm_rotates_off_a_model_refusal() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let _token_b =
@@ -2883,7 +2887,7 @@ mod tests {
     /// own 400, its refusal message intact.
     #[tokio::test]
     async fn pool_exhausted_by_model_refusals_relays_the_refusal() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let _token_b =
@@ -2924,7 +2928,7 @@ mod tests {
     /// the first account without rotating.
     #[tokio::test]
     async fn pool_relays_other_bad_requests_without_rotating() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let _token_b =
@@ -3328,7 +3332,7 @@ mod tests {
     #[tokio::test]
     async fn a_gated_pool_exhausted_on_a_stalled_429_is_cut_end_to_end() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3403,7 +3407,7 @@ mod tests {
     #[tokio::test]
     async fn a_gated_pool_relay_whose_body_sends_nothing_is_cut_end_to_end() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let env = ENV_LOCK.lock().await;
+        let env = crate::config::test_env_lock();
         let token_a =
             crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
         let (received_tx, received_rx) = tokio::sync::oneshot::channel::<()>();
@@ -3839,7 +3843,7 @@ mod tests {
     /// account relays, never the near-zero dispatch/commit time.
     #[tokio::test]
     async fn pool_stream_records_the_sample_at_classification() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_METRICS_PROBE",
             probe_token("acc-metrics"),
@@ -3885,7 +3889,7 @@ mod tests {
     /// committed 200.
     #[tokio::test]
     async fn pool_stream_records_the_terminal_status_on_exhaustion() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_METRICS_FAIL_PROBE",
             probe_token("acc-metrics-fail"),
@@ -3924,7 +3928,7 @@ mod tests {
     /// chain's per-attempt record would double-count.
     #[tokio::test]
     async fn a_chain_pool_stream_leaves_the_sample_to_the_chain() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_METRICS_CHAIN_PROBE",
             probe_token("acc-metrics-chain"),
@@ -3950,6 +3954,7 @@ mod tests {
             state.config.server.pool.as_ref(),
         );
         let events = pool_events_stream(PoolStreamContext {
+            attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
             state: state.clone(),
             route: route.clone(),
             auth: AuthMode::ChatgptOauth,
@@ -3981,7 +3986,7 @@ mod tests {
     /// records the sample.
     #[tokio::test]
     async fn pool_stream_records_the_ttfb_timeout_status() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_METRICS_TTFB_PROBE",
             probe_token("acc-metrics-ttfb"),
@@ -4033,7 +4038,7 @@ mod tests {
     /// the classified 502 from the exhaustion arm, never a committed 200.
     #[tokio::test]
     async fn pool_stream_records_the_transport_exhaustion_status() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_METRICS_REFUSED_PROBE",
             probe_token("acc-metrics-refused"),
@@ -4103,6 +4108,7 @@ mod tests {
         let (state, route) =
             pool_state_with_provider("pool-metrics-scan-probe", "http://127.0.0.1:1".to_string());
         let single = HttpSendContext {
+            attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
             state: state.clone(),
             route: route.clone(),
             policy: crate::retry::RetryPolicy::DISABLED,
@@ -4146,6 +4152,7 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
         );
         let single = HttpSendContext {
+            attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
             state: state.clone(),
             route: route.clone(),
             policy: crate::retry::RetryPolicy::DISABLED,
@@ -4202,6 +4209,7 @@ mod tests {
         let (state, route) =
             pool_state_with_provider("pool-metrics-scan-latency-probe", server.uri());
         let single = HttpSendContext {
+            attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
             state: state.clone(),
             route: route.clone(),
             policy: crate::retry::RetryPolicy::DISABLED,
@@ -4250,7 +4258,7 @@ mod tests {
     /// per-attempt record.
     #[tokio::test]
     async fn pool_or_single_carries_the_scan_time_into_the_pool_sample() {
-        let _env = ENV_LOCK.lock().await;
+        let _env = crate::config::test_env_lock();
         let _token = crate::auth::shared::EnvVarGuard::set(
             "SHUNT_POOL_SCAN_LATENCY_POOL_PROBE",
             probe_token("pool-metrics-scan-latency-pool"),
@@ -4266,6 +4274,7 @@ mod tests {
         let (state, route) =
             pool_state_with_provider("pool-metrics-scan-latency-pool-probe", server.uri());
         let single = HttpSendContext {
+            attribution: crate::client_attribution::ClientAttribution::UNATTRIBUTED,
             state: state.clone(),
             route: route.clone(),
             policy: crate::retry::RetryPolicy::DISABLED,
@@ -4313,3 +4322,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pool_xai_tests.rs"]
+mod xai_tests;

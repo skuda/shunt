@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.59.0](https://github.com/pleaseai/shunt/compare/v0.58.0...v0.59.0) (2026-10-23)
+
+
+### Features
+
+* **failover:** advance the chain on Anthropic account-level refusals ([#825](https://github.com/pleaseai/shunt/issues/825)) ([17c00ff](https://github.com/pleaseai/shunt/commit/17c00ffb4fed1e88ebe58c8053e0b1980f711291))
+
+## [0.58.0](https://github.com/pleaseai/shunt/compare/v0.57.1...v0.58.0) (2026-10-22)
+
+
+### Features
+
+* **otel:** tag per-request metrics with client_kind and managed attribution ([#811](https://github.com/pleaseai/shunt/issues/811)) ([0387f9d](https://github.com/pleaseai/shunt/commit/0387f9d56c919003399d4a6e1a5c79c942bb89aa))
+* **spend:** enforce and meter spend caps on the inbound Codex endpoint ([#814](https://github.com/pleaseai/shunt/issues/814)) ([9c706c8](https://github.com/pleaseai/shunt/commit/9c706c8fda54d64eba35cdd55ab887dac45fdbde))
+* **spend:** enforce per-user spend caps on /v1/messages (stage 2) ([#732](https://github.com/pleaseai/shunt/issues/732)) ([c4a42b8](https://github.com/pleaseai/shunt/commit/c4a42b83a95929ce6d533cc80140143c227c27c3))
+
+
+### Bug Fixes
+
+* **anthropic:** bound withheld thinking signatures and parse multi-line SSE data ([#803](https://github.com/pleaseai/shunt/issues/803)) ([82122fe](https://github.com/pleaseai/shunt/commit/82122fe57e9c874c83cb4d147f9e2e317914994e))
+* **anthropic:** restore the Claude Code identity on side queries without a first-party marker ([#824](https://github.com/pleaseai/shunt/issues/824)) ([87cee41](https://github.com/pleaseai/shunt/commit/87cee41a398f3de6487e50129bd5ef5133b60eb5))
+* **count-tokens:** load the tiktoken vocab at startup, not on the first turn ([#818](https://github.com/pleaseai/shunt/issues/818)) ([f179e78](https://github.com/pleaseai/shunt/commit/f179e78556e53a1bdec953b58ee496a5794b75eb))
+* **routing:** gate the child-pin cap re-export on the bench feature ([#812](https://github.com/pleaseai/shunt/issues/812)) ([5ebd404](https://github.com/pleaseai/shunt/commit/5ebd4042f3549901684ecb3238e37e7b3771903d))
+* **store:** bound every PostgreSQL round trip at 15 s ([#781](https://github.com/pleaseai/shunt/issues/781)) ([de14013](https://github.com/pleaseai/shunt/commit/de140138424ef3eb6a0c8767116c5de576c1b238))
+
+## [0.57.1](https://github.com/pleaseai/shunt/compare/v0.57.0...v0.57.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **anthropic:** wrap third-party thinking signatures so they never reach api.anthropic.com ([#784](https://github.com/pleaseai/shunt/issues/784)) ([dedb858](https://github.com/pleaseai/shunt/commit/dedb858919222e887fab5125a655add2cc7da9fa))
+* **store:** take the PostgreSQL hold row lock before the stale cutoff ([#796](https://github.com/pleaseai/shunt/issues/796)) ([1f91898](https://github.com/pleaseai/shunt/commit/1f918982cac82baf64183ff279da3c6b2f26949f))
+
+## [0.57.0](https://github.com/pleaseai/shunt/compare/v0.56.0...v0.57.0) (2026-10-19)
+
+
+### Features
+
+* **codex-endpoint:** relay the Codex CLI web search tool (POST */alpha/search) ([#762](https://github.com/pleaseai/shunt/issues/762)) ([9d42ba2](https://github.com/pleaseai/shunt/commit/9d42ba251dd1f0651e9d150767e3ff98a1ae042b))
+* **gateway:** serve a Claude Desktop bootstrap config endpoint ([#793](https://github.com/pleaseai/shunt/issues/793)) ([fb63c17](https://github.com/pleaseai/shunt/commit/fb63c17b6056f004b8b278d51ac884413bab9eba))
+* **store:** optional pluggable store on sqlx (SQLite, PostgreSQL), Phase 1a ([#774](https://github.com/pleaseai/shunt/issues/774)) ([b99367c](https://github.com/pleaseai/shunt/commit/b99367c2b488d8c3657c59fdfa16be7fd60c63fb))
+* **xai:** pool multiple SuperGrok OAuth accounts ([#763](https://github.com/pleaseai/shunt/issues/763)) ([d3bc2a6](https://github.com/pleaseai/shunt/commit/d3bc2a664bea4141935030407c066e1ef9e4f183))
+
+
+### Bug Fixes
+
+* **anthropic:** resend once on a transport failure before rotating accounts ([#775](https://github.com/pleaseai/shunt/issues/775)) ([c7d5103](https://github.com/pleaseai/shunt/commit/c7d5103152c02d7455c0f4fcfa5b02a7c4eace3f))
+* **store:** settle an uncertain commit under the instance-hold lock ([#780](https://github.com/pleaseai/shunt/issues/780)) ([f325d91](https://github.com/pleaseai/shunt/commit/f325d917d2bae2de7c05ee929e7a215c1cd68ea6))
+* **store:** take the SQLite write lock up front when acquiring the hold ([#786](https://github.com/pleaseai/shunt/issues/786)) ([df16768](https://github.com/pleaseai/shunt/commit/df167682b11876723415ba4bdd55a747a5d23672))
+* **test:** count 49 literal route registrations after [#763](https://github.com/pleaseai/shunt/issues/763) and [#793](https://github.com/pleaseai/shunt/issues/793) ([#797](https://github.com/pleaseai/shunt/issues/797)) ([a4536e9](https://github.com/pleaseai/shunt/commit/a4536e9764d1d0d211092fe0708f7b0e29f998d7))
+
+## [0.56.0](https://github.com/pleaseai/shunt/compare/v0.55.1...v0.56.0) (2026-10-16)
+
+
+### Features
+
+* **install:** add install.sh that installs the GitHub release binary ([#767](https://github.com/pleaseai/shunt/issues/767)) ([c1e1230](https://github.com/pleaseai/shunt/commit/c1e123043e1707b0da4abdcb6320b5b00b662fcc))
+
+
+### Bug Fixes
+
+* **responses:** defer every output item behind an unfinished function call ([#771](https://github.com/pleaseai/shunt/issues/771)) ([a790051](https://github.com/pleaseai/shunt/commit/a790051a58311c6a7ca322bb187d173b698a7b61))
+* **responses:** deliver function-call arguments sent only in done events, closes [#765](https://github.com/pleaseai/shunt/issues/765) ([#769](https://github.com/pleaseai/shunt/issues/769)) ([e09bcfd](https://github.com/pleaseai/shunt/commit/e09bcfd1be340beaca7007afd781c16e7788889c))
+
 ## [0.55.1](https://github.com/pleaseai/shunt/compare/v0.55.0...v0.55.1) (2026-10-08)
 
 

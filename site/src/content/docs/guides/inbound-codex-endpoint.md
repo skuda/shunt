@@ -25,6 +25,16 @@ Startup validation rejects an unknown `provider` or one that doesn't use `auth =
 
 The opt-in also makes Codex CLI model discovery parseable. `GET /models` and `GET /backend-api/codex/models` return the valid fallback `{"models":[]}`. On the shared `GET /v1/models` path, a `client_version` query field selects that Codex shape even when Anthropic-looking headers are present; without it, the existing Anthropic discovery response is unchanged. These requests pass the normal model-discovery auth gate, and shunt deliberately avoids fabricating incomplete Codex model rows.
 
+## Web search
+
+The Codex CLI's built-in web search tool (`web.run`) posts to `{base_url}/alpha/search` — the same base URL it appends `/responses` to. shunt registers that path for each base-URL form:
+
+- `POST /backend-api/codex/alpha/search`
+- `POST /alpha/search`
+- `POST /v1/alpha/search`
+
+A search uses the same `[server.auth]` policy and the same ChatGPT/Codex account pool (session-sticky selection, failover, refresh) as a Responses turn, and relays the request body and the reply verbatim to the backend's `/codex/alpha/search`. It always goes to `[server.codex_endpoint].provider`: a search is not a model turn, so `[[server.codex_endpoint.routes]]` does not apply. The routes accept `POST` only — the tool has no WebSocket form.
+
 ## Client analytics sink
 
 The Codex CLI also posts product analytics to the base URL. shunt accepts both paths the CLI can produce:
@@ -160,9 +170,31 @@ What changes for a routed request to a **non-ChatGPT** upstream:
 - **Header allowlist.** The fresh allowlist initially takes only `content-type` (defaulted to `application/json`) and `accept` from the client, then adds the resolved credential and the headers the routed upstream itself requires: `OpenAI-Beta: responses=experimental` (skipped for xAI/Grok), the Grok-CLI identity header set for an `xai_oauth` route, and, when an `api_key` route targets exactly `api.openai.com` and has a nonempty resolved conversation id, four regenerated session-affinity headers (`session-id`, `thread-id`, `x-client-request-id`, and `x-codex-window-id`). Client-supplied `authorization`, `x-api-key`, `chatgpt-account-id`, `originator`, `version`, `user-agent`, `session-id`, `thread-id`, `x-client-request-id`, `x-codex-*`, and `x-shunt-*` remain stripped; the stock-OpenAI values are generated, never forwarded. xAI and every other third-party OpenAI-compatible host receive no session-affinity headers. The API-key path does not synthesize `accept: text/event-stream`.
 - **Body `model` rewrite.** When `upstream_model` differs from the requested model, shunt rewrites the top-level `model` and leaves every other field intact. A body that is not a JSON object is rejected with a `400` rather than sent on.
 - **Identity encoding.** A zstd request body is decoded first — a stock Responses API does not accept that encoding — and `content-encoding` is not forwarded.
-- **One credential, no failover.** There is no pool behind a routed third party, so a 429 or 5xx relays verbatim with its `retry-after` instead of triggering rotation.
+- **One credential, no failover.** A routed third party has no failover pool, so a 429 or 5xx relays verbatim with its `retry-after` instead of triggering rotation. The one pool-aware exception is an `xai_oauth` route with named accounts: it still sends the request once (an upstream failure is relayed, not rotated), but the credential is the first account in pool selection order whose login loads (the provider's `account`/`accounts` scope honored), and an account whose login fails to load is cooled down and skipped; with no named accounts it is `~/.shunt/xai-auth.json`.
 
 Matching is exact and case-sensitive with no charset restriction, so vendor slugs like `MiniMax-M3`, `openai/gpt-5.6-sol`, and `~openai/gpt-latest` route as written. A route to another `chatgpt_oauth` provider instead keeps the full pool passthrough. Routes are read from the live config, so they take effect on reload.
+
+## Spend limits
+
+With [`[server.spend]`](/reference/configuration/#serverspend-optional) configured, the endpoint checks and meters the same per-principal caps as `/v1/messages`; without it nothing here applies. See [Gateway spend limits](https://github.com/pleaseai/shunt/blob/main/docs/gateway-spend-limits.md) for the full behavior.
+
+- **Checked first.** Every turn is checked before any upstream call, on the HTTP `POST` of all three Responses paths and on the Responses WebSocket. The principal is the static `[server.auth]` token name, the verified JWT email, or the anonymous principal when `[server.auth]` is off. This endpoint does not accept gateway-login sessions.
+- **Refusal.** An over-cap turn gets `429` with `{"error":{"message":…,"type":"usage_limit_reached","code":"usage_limit_reached","resets_at":<epoch seconds>}}`, plus `retry-after`, `x-should-retry: false` and `x-codex-promo-message: <blocked_message>`. The promo header is sent only when `blocked_message` is plain ASCII; the text always rides in the message. The named cap is the reached one that resets last. With `fail_closed_on_error`, a capped principal whose spend state is unavailable is refused with the same type, no `resets_at` and no `retry-after`.
+- **What the Codex CLI shows.** At the pinned version `rust-v0.159.3`, the Codex CLI does not retry this error. It renders its own "You've hit your usage limit … Try again at" text from `resets_at`, with the promo message when the header is present, and ignores the server message. That is Codex CLI behavior, so another version can differ.
+- **WebSocket.** A refused `response.create` gets one `{"type":"error","status":429,"error":{…},"headers":{…}}` frame carrying the same error plus `retry-after` and `x-codex-promo-message`. The socket stays open, each later turn is checked afresh, and `generate: false` warmups are not checked.
+- **Web search.** `/alpha/search` and its aliases are refused when over cap, and are never metered.
+- **Metering.** A completed turn is billed from the Responses `usage` into the counters `/v1/messages` writes, so one cap bounds both surfaces. Cached tokens bill at the cache-read rate and the rest of the input at the input rate; reasoning is inside the output and there is no cache write. A turn that ends without reported usage (a client close, a replaced turn, a broken stream) is billed a floor: the input estimated from the request body plus the output already delivered. A non-streamed 2xx JSON body is billed from its `usage` the same way; one that reports no input bills the estimated input instead.
+- **GPT pricing.** The built-in catalog has no GPT or Codex prices, so those models bill at the unknown-model rate (`$5 / $25 / $0.50 / $6.25` per million tokens, with one warning per model) until you add a row:
+
+```toml
+[[server.spend.pricing.overrides]]
+upstream = "codex"       # the endpoint's provider
+model = "gpt-6.1-sol"
+input = 1.00             # placeholder rates, USD per million tokens
+output = 8.00
+cache_read = 0.10
+cache_write = 1.00
+```
 
 ## What's different from `/v1/messages`
 

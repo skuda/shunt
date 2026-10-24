@@ -16,7 +16,10 @@
 //! the body `model` rewritten to the route's `upstream_model` when they differ.
 //! See `docs/m11-inbound-codex-endpoint.md`.
 
-use std::time::Instant;
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -27,17 +30,25 @@ use axum::{
 use tracing::Instrument;
 
 use crate::{
-    adapters::{responses, AdapterError},
+    adapters::{
+        responses::{self, CodexOperation},
+        AdapterError,
+    },
     auth::{gate, inbound::InboundAuth, inbound_jwt::JwksCache},
+    client_attribution::ClientAttribution,
     config::CodexRouteConfig,
     error::ShuntError,
+    proxy::spend_gate::ServedTarget,
     routing::{AdapterKind, Route},
     server::AppState,
+    stream_metrics::SpendTap,
 };
 
 pub mod frame;
 mod model;
 mod routing;
+pub mod search;
+mod spend;
 pub mod websocket;
 
 #[cfg(test)]
@@ -69,6 +80,20 @@ pub async fn post(
     headers: HeaderMap,
     body: Body,
 ) -> axum::response::Response {
+    serve(state, method, uri, headers, body, CodexOperation::Responses).await
+}
+
+/// The body of every inbound Codex HTTP handler ([`post`] and
+/// [`search::post`]): authenticate, read the body, relay it to `operation`
+/// over the pool, and re-shape a gateway-owned error for an OpenAI client.
+async fn serve(
+    state: AppState,
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Body,
+    operation: CodexOperation,
+) -> axum::response::Response {
     let state = state.refreshed();
     let started_at = Instant::now();
     let path = uri.path().to_string();
@@ -93,12 +118,22 @@ pub async fn post(
         session_id = span_session_id,
         gen_ai.request.model = tracing::field::Empty,
         shunt.provider = tracing::field::Empty,
+        shunt.client_kind = tracing::field::Empty,
+        shunt.managed = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         otel.status_code = tracing::field::Empty
     );
 
     async move {
-        match forward(state, session_id, headers, body, started_at).await {
+        match forward(state, session_id, headers, body, started_at, operation).await {
+            Ok((status, response)) if response.extensions().get::<SpendRefused>().is_some() => {
+                tracing::info!(
+                    upstream_status = status.as_u16(),
+                    latency_ms = started_at.elapsed().as_millis(),
+                    "inbound codex request refused: spend limit"
+                );
+                response
+            }
             Ok((status, response)) => {
                 tracing::info!(
                     upstream_status = status.as_u16(),
@@ -152,12 +187,30 @@ impl From<AdapterError> for ForwardError {
     }
 }
 
+/// Marks a response as a spend refusal, so [`post`] logs it as the gateway's
+/// own answer rather than a proxied upstream one.
+#[derive(Clone)]
+struct SpendRefused;
+
+/// A spend refusal, kept verbatim (it is already OpenAI-shaped) with its 429
+/// recorded on the request span: nothing reached an upstream.
+fn spend_refused(
+    provider: &str,
+    refusal: spend::Refusal,
+) -> (StatusCode, axum::response::Response) {
+    crate::observability::record_span_outcome(provider, StatusCode::TOO_MANY_REQUESTS);
+    let mut response = refusal.into_response();
+    response.extensions_mut().insert(SpendRefused);
+    (StatusCode::TOO_MANY_REQUESTS, response)
+}
+
 async fn forward(
     state: AppState,
     session_id: Option<String>,
     headers: HeaderMap,
     body: Body,
     started_at: Instant,
+    operation: CodexOperation,
 ) -> Result<(StatusCode, axum::response::Response), ForwardError> {
     // The routes are only registered when `[server.codex_endpoint]` is set, but
     // read the snapshot defensively; config validation guarantees the named
@@ -189,6 +242,10 @@ async fn forward(
         .to_string(),
         response: Box::new(err.into_response()),
     })?;
+    // Recorded as soon as the caller is authenticated, so a request rejected
+    // while its body is read (413, an interrupted upload) still carries the
+    // attribution on its span.
+    let attribution = inbound_attribution(&headers);
 
     let max_request_bytes = state.config.server.limits.max_request_bytes;
     if crate::http_tuning::content_length_exceeds(&headers, max_request_bytes) {
@@ -216,7 +273,47 @@ async fn forward(
     // `adapters/responses/mod.rs`). The raw `session_id` is still what the tracing
     // span records above; only the pool key is namespaced.
     let pool_key = pool_sticky_key(inbound_client.as_deref(), session_id.clone());
-    forward_turn(state, None, pool_key, session_id, headers, body, started_at).await
+    match operation {
+        CodexOperation::Responses => {
+            // Spend admission precedes every upstream-capable step. Its refusal
+            // is already OpenAI-shaped, so it returns `Ok` and skips the lossy
+            // re-shape in `serve`.
+            let admitted = match spend::admit(&state, inbound_client.as_deref()) {
+                Ok(admitted) => admitted,
+                Err(refusal) => return Ok(spend_refused(&provider, refusal)),
+            };
+            forward_turn(
+                state,
+                None,
+                pool_key,
+                session_id,
+                headers,
+                attribution,
+                body,
+                started_at,
+                admitted.tap,
+                None,
+            )
+            .await
+        }
+        CodexOperation::AlphaSearch => {
+            // An over-cap principal gets the same refusal as a turn. Search is
+            // never metered, so the `Admitted` value is dropped: no tap.
+            if let Err(refusal) = spend::admit(&state, inbound_client.as_deref()) {
+                return Ok(spend_refused(&provider, refusal));
+            }
+            search::forward(
+                state,
+                provider,
+                pool_key,
+                headers,
+                attribution,
+                body,
+                started_at,
+            )
+            .await
+        }
+    }
 }
 
 pub(crate) fn extract_session_id(headers: &HeaderMap) -> Option<String> {
@@ -269,14 +366,18 @@ pub(crate) async fn authenticate_inbound(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_turn(
     state: AppState,
     model: Option<String>,
     pool_key: Option<String>,
     session_id: Option<String>,
     headers: HeaderMap,
+    attribution: ClientAttribution,
     body: Bytes,
     started_at: Instant,
+    spend: Option<SpendTap>,
+    estimate_body: Option<Bytes>,
 ) -> Result<(StatusCode, axum::response::Response), ForwardError> {
     let Some(codex_endpoint) = &state.config.server.codex_endpoint else {
         return Err(ForwardError {
@@ -332,7 +433,17 @@ pub(crate) async fn forward_turn(
 
     crate::observability::record_requested_model(&model_name);
 
-    let (provider, result) = match matched {
+    // A turn that ends without reported usage bills an estimate of this body
+    // (or of `estimate_body`, the whole input of a continuation).
+    let spend = spend.map(|tap| {
+        tap.with_request_body(
+            estimate_body.unwrap_or_else(|| body.clone()),
+            crate::compression::body_encoding(&headers),
+            max_request_bytes,
+        )
+    });
+
+    let (provider, upstream_model, result) = match matched {
         Some(route) => {
             dispatch_routed(
                 state,
@@ -357,19 +468,51 @@ pub(crate) async fn forward_turn(
                 effort: None,
                 service_tier: None,
             };
-            let result =
-                responses::forward_codex_inbound(state, route, pool_key, headers, body).await;
-            (default_provider, result)
+            let result = responses::forward_codex_inbound(
+                state,
+                route,
+                pool_key,
+                headers,
+                body,
+                CodexOperation::Responses,
+            )
+            .await;
+            (default_provider, model_name.clone(), result)
         }
     };
 
-    record_outcome(provider, model_name, started_at, result)
+    if let Some(tap) = &spend {
+        // Every route on this endpoint is served with a gateway credential.
+        tap.set_target(&ServedTarget {
+            provider: provider.clone(),
+            model: model_name.clone(),
+            upstream_model,
+            meters: true,
+        });
+    }
+    record_served_outcome(provider, model_name, attribution, started_at, result, spend)
+}
+
+/// The `client_kind`/`managed` attribution of one inbound Codex request,
+/// recorded on the current span as well.
+///
+/// `managed` is always `false` here: every auth path of this endpoint — the
+/// HTTP routes and the inbound Responses WebSocket alike — authenticates only
+/// `[server.auth]` (`authenticate_inbound`, a static token or an external-IdP
+/// JWT), never a gateway-issued JWT, so no request reaching it can be
+/// attributed to a gateway credential without changing authentication
+/// semantics (`docs/otlp-client-attribution.md`).
+pub(crate) fn inbound_attribution(headers: &HeaderMap) -> ClientAttribution {
+    let attribution = ClientAttribution::new(headers, false);
+    crate::observability::record_client_attribution(attribution);
+    attribution
 }
 
 /// Dispatch a request whose `model` matched a `[[server.codex_endpoint.routes]]`
 /// entry. Returns the provider the observability tail should label the request
-/// with (the *routed* provider, not the endpoint's configured default) alongside
-/// the forwarder's result.
+/// with (the *routed* provider, not the endpoint's configured default) and the
+/// model it was sent (what the spend meter prices) alongside the forwarder's
+/// result.
 ///
 /// A ChatGPT/Codex-backed route keeps the full pool passthrough
 /// (`forward_codex_inbound`: selection, failover, refresh, `x-shunt-account`)
@@ -394,6 +537,7 @@ async fn dispatch_routed(
     max_request_bytes: usize,
 ) -> Result<
     (
+        String,
         String,
         Result<(StatusCode, axum::response::Response), AdapterError>,
     ),
@@ -448,11 +592,19 @@ async fn dispatch_routed(
     };
 
     let result = if chatgpt_backend {
-        responses::forward_codex_inbound(state, route, pool_key, headers, body).await
+        responses::forward_codex_inbound(
+            state,
+            route,
+            pool_key,
+            headers,
+            body,
+            CodexOperation::Responses,
+        )
+        .await
     } else {
-        responses::forward_codex_routed(state, route, headers, body, session_id).await
+        responses::forward_codex_routed(state, route, headers, body, pool_key, session_id).await
     };
-    Ok((route_config.provider, result))
+    Ok((route_config.provider, upstream_model, result))
 }
 
 /// Turn a routed body failure into the gateway-owned response the client sees.
@@ -494,8 +646,22 @@ async fn routed_body_error(error: BodyError, provider: &str) -> ForwardError {
 fn record_outcome(
     provider: String,
     model: String,
+    attribution: ClientAttribution,
     started_at: Instant,
     result: Result<(StatusCode, axum::response::Response), AdapterError>,
+) -> Result<(StatusCode, axum::response::Response), ForwardError> {
+    record_served_outcome(provider, model, attribution, started_at, result, None)
+}
+
+/// [`record_outcome`] for a metered turn: `spend` bills the served response
+/// once it ends. `None` observes it unmetered.
+fn record_served_outcome(
+    provider: String,
+    model: String,
+    attribution: ClientAttribution,
+    started_at: Instant,
+    result: Result<(StatusCode, axum::response::Response), AdapterError>,
+    spend: Option<SpendTap>,
 ) -> Result<(StatusCode, axum::response::Response), ForwardError> {
     let status_code = match &result {
         Ok((status, _)) => *status,
@@ -506,17 +672,20 @@ fn record_outcome(
     crate::metrics::record_proxied_request(
         &provider,
         &model,
+        attribution,
         status_code.as_u16(),
         started_at.elapsed().as_secs_f64() * 1000.0,
     );
     result
         .map(|(status, response)| {
-            let response = crate::stream_metrics::observe_response(
+            let response = crate::stream_metrics::observe_served(
                 response,
                 crate::stream_metrics::Protocol::Responses,
-                provider,
-                model,
+                Arc::new(Mutex::new(provider)),
+                Arc::new(Mutex::new(model)),
+                attribution,
                 started_at,
+                spend,
             );
             (status, response)
         })

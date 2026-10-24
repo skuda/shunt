@@ -25,6 +25,16 @@ shunt run
 
 该可选功能也使 Codex CLI 的模型发现可被正确解析。`GET /models` 和 `GET /backend-api/codex/models` 返回有效的回退形状 `{"models":[]}`。在共用的 `GET /v1/models` 路径上,`client_version` 查询字段优先于类 Anthropic 的头部并选择 Codex 形状;没有该字段时,现有 Anthropic 发现响应保持不变。这些请求先通过常规模型发现认证门,且 shunt 不会伪造不完整的 Codex 模型行。
 
+## 网页搜索
+
+Codex CLI 的内置网页搜索工具(`web.run`)会向 `{base_url}/alpha/search` 发送 POST 请求,这与它追加 `/responses` 的 base URL 相同。shunt 为每种 base URL 形式都注册了该路径:
+
+- `POST /backend-api/codex/alpha/search`
+- `POST /alpha/search`
+- `POST /v1/alpha/search`
+
+搜索与 Responses 轮次使用相同的 `[server.auth]` 策略和相同的 ChatGPT/Codex 账户池(会话粘性选择、故障转移、刷新),并把请求体和响应逐字中继到后端的 `/codex/alpha/search`。搜索不是模型轮次,因此 `[[server.codex_endpoint.routes]]` 不适用,它总是发往 `[server.codex_endpoint].provider`。这些路由只接受 `POST` —— 该工具没有 WebSocket 形式。
+
 ## 客户端分析数据接收端
 
 Codex CLI 还会向 base URL 提交产品分析数据。shunt 接受该 CLI 可能产生的两条路径:
@@ -160,9 +170,31 @@ shunt 对 Codex CLI 的发现请求返回有效的空回退 `{"models":[]}`，�
 - **请求头白名单。** 新白名单起初只从客户端取得 `content-type`（缺省为 `application/json`）和 `accept`，然后加入解析出的凭据，以及被路由到的上游自身所需的请求头：xAI/Grok 会省略的 `OpenAI-Beta: responses=experimental`、`xai_oauth` 路由的整套 Grok CLI identity 请求头，以及当 `api_key` 路由的目标主机恰好是 `api.openai.com` 且解析出了非空 conversation id 时，重新生成的四个会话亲和请求头（`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id`）。客户端发送的 `authorization`、`x-api-key`、`chatgpt-account-id`、`originator`、`version`、`user-agent`、`session-id`、`thread-id`、`x-client-request-id`、`x-codex-*`、`x-shunt-*` 仍会被剥离；原生 OpenAI 所用的值也是重新生成，而不是转发。xAI 和其他第三方 OpenAI 兼容主机都不会收到这些会话亲和请求头。API 密钥路径也不会生成 `accept: text/event-stream`。
 - **改写请求体的 `model`。** 当 `upstream_model` 与请求的模型不同时，shunt 只改写顶层的 `model`，其余字段原样保留。不是 JSON 对象的请求体会以 `400` 拒绝，而不会被继续转发。
 - **identity 编码。** zstd 请求体会先解码（原生 Responses API 不接受该编码），且不转发 `content-encoding`。
-- **单一凭据，无故障转移。** 被路由到的第三方背后没有账号池，因此 429 或 5xx 会连同 `retry-after` 原样转发，不会触发轮换。
+- **单一凭据，无故障转移。** 被路由到的第三方背后没有故障转移账号池，因此 429 或 5xx 会连同 `retry-after` 原样转发，不会触发轮换。唯一感知账户池的例外是带命名账户的 `xai_oauth` 路由：它同样只发送一次请求（上游失败会原样转发，不会轮换），其凭据是账户池选择顺序中第一个能加载登录的账户（遵循提供方的 `account`/`accounts` 范围），无法加载登录的账户会被冷却并跳过；没有命名账户时，它是 `~/.shunt/xai-auth.json`。
 
 匹配是精确且区分大小写的，并且不限制字符集，所以 `MiniMax-M3`、`openai/gpt-5.6-sol`、`~openai/gpt-latest` 这类厂商标识都会按写法路由。指向另一个 `chatgpt_oauth` 提供方的路由则仍保留完整的账号池透传。路由从实时配置读取，因此在重载时生效。
+
+## 支出限制
+
+配置 [`[server.spend]`](/zh-cn/reference/configuration/#serverspend可选)后,该端点会按与 `/v1/messages` 相同的主体上限进行检查和计量;未配置时下列内容均不适用。完整行为见 [Gateway spend limits](https://github.com/pleaseai/shunt/blob/main/docs/gateway-spend-limits.md)(英文)。
+
+- **检查时机。** 每个回合在调用任何上游之前检查,覆盖三条 Responses 路径的 HTTP `POST` 和 Responses WebSocket。主体是静态 `[server.auth]` 令牌名、已验证的 JWT 邮箱,或 `[server.auth]` 关闭时的匿名主体。该端点不接受 gateway 登录会话。
+- **拒绝响应。** 超限的回合收到 `429` 和 `{"error":{"message":…,"type":"usage_limit_reached","code":"usage_limit_reached","resets_at":<纪元秒>}}`,并带有 `retry-after`、`x-should-retry: false` 和 `x-codex-promo-message: <blocked_message>` 头部。仅当 `blocked_message` 为纯 ASCII 时才发送 promo 头部,文本始终也在 message 中。被点名的上限是已达上限中最晚重置的一个。启用 `fail_closed_on_error` 时,支出状态不可用的有上限主体会以相同的 type 被拒绝,且没有 `resets_at` 和 `retry-after`。
+- **Codex CLI 的显示。** 在固定版本 `rust-v0.159.3` 上,Codex CLI 不会重试该错误。它根据 `resets_at` 显示自己的文案("You've hit your usage limit … Try again at"),头部存在时一并显示 promo 消息,并忽略服务器消息。这是 Codex CLI 的行为,其他版本可能不同。
+- **WebSocket。** 被拒绝的 `response.create` 会收到一个 `{"type":"error","status":429,"error":{…},"headers":{…}}` 帧,其中包含相同的错误以及 `retry-after` 和 `x-codex-promo-message`。套接字保持打开,之后每个回合都会重新检查,`generate: false` 的预热不检查。
+- **网页搜索。** `/alpha/search` 及其别名在超限时被拒绝,且从不计量。
+- **计量。** 已完成的回合按 Responses 的 `usage` 计费,计入 `/v1/messages` 所写的同一组计数器,因此一个上限同时约束两个界面。缓存 token 按缓存读取费率计费,其余输入按输入费率计费;推理计入输出,没有缓存写入。未报告用量就结束的回合(客户端关闭、被替换的回合、中断的流)按"由请求体估算的输入加上已送达的输出"这一下限计费。非流式的 2xx JSON 响应体同样按其 `usage` 计费;未报告输入的响应体则改按估算的输入计费。
+- **GPT 价格。** 内置价目表没有 GPT/Codex 的价格,因此这些模型在添加行之前按未知模型费率计费(每百万 token `$5 / $25 / $0.50 / $6.25`,每个模型一次警告):
+
+```toml
+[[server.spend.pricing.overrides]]
+upstream = "codex"       # 端点的 provider
+model = "gpt-6.1-sol"
+input = 1.00             # 示例费率,每百万 token 的美元数
+output = 8.00
+cache_read = 0.10
+cache_write = 1.00
+```
 
 ## 与 `/v1/messages` 的差异
 

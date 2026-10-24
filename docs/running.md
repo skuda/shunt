@@ -190,11 +190,11 @@ Both metric sinks export the same low-cardinality series:
 
 | Series | Type | Attributes | Meaning |
 | :-- | :-- | :-- | :-- |
-| `shunt.requests` | Counter | `provider`, `model`, `http.response.status_code` | Inference requests; token-count requests are excluded. |
-| `shunt.latency` | Histogram (ms) | `provider`, `model`, `http.response.status_code` | Time to response headers for streams and full latency for non-streaming responses; the committed streaming responses sample from dispatch to attempt classification, since their headers commit before the upstream responds. |
-| `shunt.ttft` | Histogram (ms) | `provider`, `model` | Time from request start to the first complete non-keepalive SSE frame. |
-| `shunt.stream_outcome` | Counter | `provider`, `model`, `outcome` | Exactly one stream result: `completed`, `error_event`, `upstream_cut`, or `client_disconnect`. |
-| `shunt.tokens` | Counter | `provider`, `model`, `kind` | Last reported streaming usage for `input`, `output`, `cache_read`, or `cache_creation`; non-streaming usage is not recorded. |
+| `shunt.requests` | Counter | `provider`, `model`, `http.response.status_code`, `caller`, `client_kind`, `managed` | Inference requests; token-count requests are excluded. |
+| `shunt.latency` | Histogram (ms) | `provider`, `model`, `http.response.status_code`, `caller`, `client_kind`, `managed` | Time to response headers for streams and full latency for non-streaming responses; the committed streaming responses sample from dispatch to attempt classification, since their headers commit before the upstream responds. |
+| `shunt.ttft` | Histogram (ms) | `provider`, `model`, `client_kind`, `managed` | Time from request start to the first complete non-keepalive SSE frame. |
+| `shunt.stream_outcome` | Counter | `provider`, `model`, `outcome`, `client_kind`, `managed` | Exactly one stream result: `completed`, `error_event`, `upstream_cut`, or `client_disconnect`. |
+| `shunt.tokens` | Counter | `provider`, `model`, `kind`, `client_kind`, `managed` | Last reported streaming usage for `input`, `output`, `cache_read`, or `cache_creation`; non-streaming usage is not recorded. |
 | `shunt.codex_continuation` | Counter | `provider`, `outcome` | Codex WebSocket continuation `hit` or full-input `fallback`. |
 | `shunt.codex_ws_overflow` | Counter | `provider`, `outcome` | Codex WebSocket dedicated overflow connection `opened` or ceiling-`refused` (issue #248). |
 | `shunt.upstream_retries` | Counter | `provider`, `reason` | Bounded transient retries. |
@@ -204,6 +204,27 @@ Both metric sinks export the same low-cardinality series:
 | `shunt.pool.quota_utilization` | Gauge | `provider`, `window` | Minimum utilization across enabled, non-stale accounts for `5h`, `7d`, or `7d_oi`. |
 | `shunt.pool.rotations` | Counter | `provider`, `reason` | Account rotations and pool exhaustion by low-cardinality cause. |
 | `shunt.pool.reprobes` | Counter | `provider` | Reprobes committed at the first HTTP dispatch for stale near-quota Codex/ChatGPT accounts; WebSocket-enabled providers count inbound HTTP probes only. |
+
+The five per-request series above carry two extra attributes: `client_kind` is
+`claude-code`, `codex`, or `other`, derived from the request's own client
+headers (`x-app`, `originator`, `user-agent`; the raw value is never exported),
+and `managed` is `true` only when the request authenticated with a
+gateway-issued JWT — the credential that also makes a client eligible for the
+pushed `OTEL_*` environment. Together they separate shunt's server-derived
+series from a client's own `claude_code.*` OTLP export, so a dashboard can take
+`claude_code.*` where it exists and `shunt.*{managed="false"}` everywhere else
+without double counting; see [`otlp-client-attribution.md`](otlp-client-attribution.md).
+That filter assumes the backend receives the managed clients' `claude_code.*`
+metrics, relayed through a `[server.gateway.telemetry].forward_to` destination
+with `metrics` on or exported by the clients directly. When it does not, read
+`shunt.*` across both `managed` values instead.
+A judge call a `[models.router]` entry makes (`caller="router"`) carries the
+originating turn's `client_kind` but is always `managed="false"`: it is shunt's
+own traffic, which no client exporter reports. The inbound Codex endpoint
+authenticates only `[server.auth]`, so its requests are always
+`managed="false"`. The same two values are recorded on the request span as
+`shunt.client_kind` and `shunt.managed`. An inbound Codex WebSocket turn has no
+request span, so its attribution appears on the metrics only.
 
 **Routing precedence** (`src/routing.rs`): matching `[models.upstream_model]` entry → exact
 `[[routes]]` match → `[[route_prefixes]]` prefix match → `server.default_provider`. A model
@@ -220,7 +241,7 @@ a brand-new table adds a provider. Every provider takes these keys:
 | :-- | :-- | :-- |
 | `kind` | `anthropic` \| `responses` \| `cursor` | Upstream protocol / adapter. `anthropic` = Messages API (passed through, optionally re-keyed); `responses` = Anthropic Messages translated to the OpenAI Responses API; `cursor` = Cursor's native ConnectRPC/protobuf AgentService. |
 | `base_url` | URL | Upstream base; shunt appends the provider endpoint path. |
-| `auth` | `passthrough` \| `api_key` \| `chatgpt_oauth` \| `claude_oauth` \| `kimi_oauth` \| `xai_oauth` \| `cursor_oauth` | `passthrough` forwards the client's credential; `api_key` injects `api_key_env`; `chatgpt_oauth` uses Codex/ChatGPT OAuth; `claude_oauth` selects an Anthropic subscription account pool (see §3.3); `kimi_oauth` selects a Kimi Code subscription account pool (`shunt login kimi`; see the Kimi Code example below); `xai_oauth` and `cursor_oauth` reuse their shunt-managed subscription logins. |
+| `auth` | `passthrough` \| `api_key` \| `chatgpt_oauth` \| `claude_oauth` \| `kimi_oauth` \| `xai_oauth` \| `cursor_oauth` | `passthrough` forwards the client's credential; `api_key` injects `api_key_env`; `chatgpt_oauth` uses Codex/ChatGPT OAuth; `claude_oauth` selects an Anthropic subscription account pool (see §3.3); `kimi_oauth` selects a Kimi Code subscription account pool (`shunt login kimi`; see the Kimi Code example below); `xai_oauth` reuses `shunt login xai` and pools named accounts (`shunt login xai --name`; see [`m18-xai-multi-account.md`](m18-xai-multi-account.md)); `cursor_oauth` reuses its shunt-managed subscription login. |
 | `api_key_env` | env var name | Where the key is read from, when `auth = "api_key"`. |
 | `api_key_header` | `bearer` (default) \| `x_api_key` | Header the injected key is sent in. |
 | `effort` | `low`…`max` | Optional default reasoning effort (`responses` providers). |
@@ -447,6 +468,9 @@ there is no equivalent upstream endpoint, so the provider's `count_tokens` setti
   image/tool-schema encoding or cache accounting. Each count is answered in-process (~ms), which
   matters because Claude Code's `/context` issues one `count_tokens` call **per displayed item**
   (system-prompt section, memory file, agent, deferred tool, …) — 30–50 calls per invocation.
+  The encoder's vocabulary loads once at startup (about half a second) whenever a non-Anthropic
+  provider uses this setting, so neither the first count nor the first streaming turn's
+  `message_start` input estimate waits on it.
 - `count_tokens = "estimate"` (opt-in) — shunt returns **501 `not_supported`**, telling Claude
   Code that the endpoint is unavailable and triggering its fallback. Note what Claude Code actually
   does then: the main-loop context bar estimates locally, but `/context` re-runs **every** category
@@ -776,6 +800,8 @@ xAI API access (a subscription-tier gate) — shunt says so distinctly and point
 > (e.g. `effort = "high"` under `[providers.xai]` or a `[[routes]]` entry). Without it, grok
 > reasons on its own and shunt sends no `reasoning` object.
 
+**Several SuperGrok accounts.** `shunt login xai --name <name>` stores a login at `~/.shunt/accounts/xai/<name>.json` (override the directory with `SHUNT_XAI_ACCOUNTS_DIR`). With no config change, an `xai_oauth` provider pools every account there and rotates on `401`/`402`/`429`/`5xx` (a `403` is relayed); scope it with `[[providers.grok.accounts]]` or `auth = { mode = "xai_oauth", accounts = [...] }`. `~/.shunt/xai-auth.json` is used only while that pool is empty. Spec: [`m18-xai-multi-account.md`](m18-xai-multi-account.md).
+
 ### 5.4 Select a mapped model (primary path)
 
 Claude Code's model-discovery only honors ids beginning with `claude`/`anthropic`, so for
@@ -974,6 +1000,14 @@ export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 
 This is global, so it also removes attribution from any Anthropic-passthrough traffic (used for
 cost tracking) — which is fine when you're routing to another provider.
+
+With `=0`, some Claude Code side requests carry no first-party marker at all: mods'
+`$.model.complete` queries lose the attribution block that was their only one, and the auto-mode
+classifier never carries the identity prompt. On a subscription-OAuth Anthropic route those would
+otherwise reach `api.anthropic.com` unmarked and come back as a bare 429 (`client-shape-rejection`). shunt
+re-adds the Claude Code identity block on Claude Code requests (identified by
+`x-claude-code-session-id`, a `claude-cli/` user agent, or `x-app: cli`) that carry no accepted marker, so `=0`
+stays safe.
 
 ### 5.8 Context / usage display for mapped models
 

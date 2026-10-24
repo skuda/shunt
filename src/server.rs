@@ -13,7 +13,7 @@ use crate::{
     auth::{inbound::InboundAuth, inbound_jwt::JwksCache},
     codex_analytics, codex_endpoint,
     concurrency::{limit_requests, ConcurrencyLimit},
-    config::{Config, ConfigError},
+    config::{Config, ConfigError, CountTokens, ProviderKind},
     discovery,
     gateway::{self, GatewayAuth, GatewayStores},
     http_tuning::{enforce_http_tuning, HttpTuningLayer},
@@ -64,6 +64,9 @@ pub struct AppState {
     /// [`AppState::prefill_routers`]: a reload rebuilds them, and with them
     /// the session state libsy keeps inside each algorithm.
     pub(crate) driven_routers: Arc<crate::routing::driven::DrivenRouters>,
+    /// The spend meter's rate table for this request's config snapshot, read
+    /// off `current` like [`AppState::config`] so a reload re-prices.
+    pub(crate) spend_prices: Arc<crate::gateway::spend::pricing::PriceTable>,
     /// Process-lifetime JWKS cache for `[[server.auth.jwt]]` issuers. Kept here
     /// rather than on `inbound_auth` so a reload that re-resolves the entries
     /// does not throw away keys it would immediately refetch — and so a
@@ -131,6 +134,7 @@ impl AppState {
             gateway_auth: current.gateway_auth.clone(),
             prefill_routers: current.prefill_routers.clone(),
             driven_routers: current.driven_routers.clone(),
+            spend_prices: current.spend_prices.clone(),
             http_client,
             accounts,
             status,
@@ -182,6 +186,15 @@ fn boot_is_loopback(config: &Config) -> bool {
         .is_ok_and(|addr| addr.ip().is_loopback())
 }
 
+/// Whether any provider counts tokens with the local encoder. Anthropic
+/// providers pass `count_tokens` upstream whatever the setting says, so only a
+/// non-Anthropic provider left at `tiktoken` ever loads the vocab.
+fn counts_tokens_locally(config: &Config) -> bool {
+    config.providers.values().any(|provider| {
+        provider.kind != ProviderKind::Anthropic && provider.count_tokens == CountTokens::Tiktoken
+    })
+}
+
 /// Build the router and return it alongside the [`SharedState`] it reads and a
 /// clone of the request [`AppState`], so the caller can spawn reload watchers
 /// that hot-swap the same store and background tasks (the usage poller) that
@@ -191,6 +204,12 @@ pub fn build_router(config: Config) -> Result<(Router, SharedState, AppState), C
     // validates, but callers may construct `Config` programmatically.
     let runtime = RuntimeState::from_config(config)?;
     let config = runtime.config.as_ref();
+    // Pay the tiktoken vocab's one-time cold load (~0.6 s) here rather than on
+    // the first turn, whose estimate is bounded at one second and would
+    // otherwise seed `message_start` with `input_tokens: 0` (issue #642).
+    if counts_tokens_locally(config) {
+        crate::count_tokens::warm_encoder();
+    }
     // The inbound concurrency gate is fixed at boot because its semaphore is
     // installed as a router layer. Reloaded values take effect after restart.
     let max_concurrent_requests = config.server.max_concurrent_requests;
@@ -316,6 +335,11 @@ pub fn build_router(config: Config) -> Result<(Router, SharedState, AppState), C
                 get(codex_endpoint::websocket::get).post(codex_endpoint::post),
             );
         }
+        // The Codex CLI's web-search tool posts to `{base_url}/alpha/search`.
+        // POST only: unlike a Responses turn there is no WebSocket form of it.
+        for path in codex_endpoint::search::PATHS {
+            router = router.route(path, post(codex_endpoint::search::post));
+        }
         for path in codex_analytics::PATHS {
             router = router.route(path, post(codex_analytics::post));
         }
@@ -392,6 +416,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)] // Intentional cross-module test serialization.
 mod tests {
     use axum::{
         body::{Body, HttpBody},
@@ -477,6 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn usage_route_is_registered_and_answers_when_enabled_with_valid_auth() {
+        let _env_lock = crate::config::test_env_lock();
         let (config, env) = config_with_usage_enabled("registered");
         let (router, _shared, _state) = build_router(config).unwrap();
 

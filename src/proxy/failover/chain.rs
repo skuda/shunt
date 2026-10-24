@@ -23,11 +23,12 @@ use axum::response::IntoResponse;
 
 use crate::{error::ShuntError, routing::Route, server::AppState};
 
+use super::refusal::AccountRefused;
 use super::{
     dispatch, headers_for_route, is_passthrough_route, provider_origin, stamp_gateway_headers,
     InboundContext, RouterStamp,
 };
-use crate::proxy::ForwardError;
+use crate::proxy::{spend_gate::ServedTarget, ForwardError};
 use crate::{
     adapters::{AdapterError, AdapterFailure},
     request::RequestBody,
@@ -81,6 +82,10 @@ pub(crate) struct ChainRequest<'a> {
     /// caller's, post-`check_inbound_auth`, or a judge call's stripped set.
     pub base_headers: &'a HeaderMap,
     pub inbound: &'a InboundContext,
+    /// Carries the `client_kind`/`managed` attribution every attempt's
+    /// `shunt.requests` sample is tagged with
+    /// ([`RequestBody::attribution`]): the caller's on a client turn, the
+    /// originating turn's `client_kind` with `managed = false` on a judge call.
     pub body: RequestBody,
     /// The advertised id, for the response stamp and the metric label.
     pub requested_model: &'a str,
@@ -98,9 +103,9 @@ pub(crate) struct ChainRequest<'a> {
 pub(crate) struct ChainSuccess {
     pub status: StatusCode,
     pub response: axum::response::Response,
-    /// The upstream that answered, for the observers `forward` applies.
-    pub provider: String,
-    pub model: String,
+    /// The upstream that answered, for the observers `forward` applies, and
+    /// what its usage is priced on.
+    pub target: ServedTarget,
 }
 
 /// Attempt each route in order until one answers with a status the chain does
@@ -137,6 +142,7 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
         .expect("route chains are non-empty after resolution")
         .clone();
     let primary_origin = primary_origin(&state, &routes);
+    let attribution = body.attribution();
     let mut body = Some(body);
     let mut remembered: Option<RememberedFailure> = None;
     for (index, route) in routes.into_iter().enumerate() {
@@ -150,8 +156,14 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
             primary_origin.as_deref(),
         );
         let provider = route.provider.clone();
-        let model = route.model.clone();
-        let upstream_model = route.upstream_model.clone();
+        let target = ServedTarget::of(
+            &state,
+            &route,
+            body.as_ref().expect("request body is present").json(),
+        );
+        // The header names the model the route was configured to send; the
+        // classifier-pinned one is carried in `target` for pricing only.
+        let stamped_model = route.upstream_model.clone();
         let attempt_started_at = Instant::now();
         // Move the buffered body into the final attempt instead of cloning it. Within
         // this failover loop, the common single-upstream chain transfers the body
@@ -194,7 +206,8 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
             crate::metrics::record_proxied_request_as(
                 caller,
                 &provider,
-                &model,
+                &target.model,
+                attribution,
                 status,
                 attempt_started_at.elapsed().as_secs_f64() * 1000.0,
             );
@@ -206,30 +219,34 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
                     &mut response,
                     &provider,
                     requested_model,
-                    &upstream_model,
+                    &stamped_model,
                     router_stamp,
                 );
-                if !is_advance_status(status) {
+                // An account-level refusal advances like a 429 although its
+                // status is terminal; the adapter judged the body and logged
+                // the refusal once, with its skip window (#817).
+                let refused = response.extensions().get::<AccountRefused>().is_some();
+                if !is_advance_status(status) && !refused {
                     finish(&provider, status);
                     return Ok(ChainSuccess {
                         status,
                         response,
-                        provider,
-                        model,
+                        target,
                     });
                 }
-                tracing::warn!(
-                    provider = %provider,
-                    model = %model,
-                    status = status.as_u16(),
-                    "upstream response triggered failover advance"
-                );
+                if !refused {
+                    tracing::warn!(
+                        provider = %provider,
+                        model = %target.model,
+                        status = status.as_u16(),
+                        "upstream response triggered failover advance"
+                    );
+                }
                 remember_failure(
                     &mut remembered,
                     status,
                     FinalResponse::Relayed(response),
-                    provider.clone(),
-                    model,
+                    target,
                 );
             }
             Err(error) => {
@@ -242,24 +259,23 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
                     &mut response,
                     &provider,
                     requested_model,
-                    &upstream_model,
+                    &stamped_model,
                     router_stamp,
                 );
                 match failure {
                     Some(AdapterFailure::UpstreamStatus(raw_status))
                         if is_advance_status(raw_status) =>
                     {
-                        log_error_advance(&provider, &model, raw_status, &message);
+                        log_error_advance(&provider, &target.model, raw_status, &message);
                         remember_failure(
                             &mut remembered,
                             raw_status,
                             FinalResponse::MappedError { message, response },
-                            provider.clone(),
-                            model,
+                            target,
                         );
                     }
                     Some(AdapterFailure::BeforeHeaders) => {
-                        log_before_headers_advance(&provider, &model, &message);
+                        log_before_headers_advance(&provider, &target.model, &message);
                     }
                     _ => {
                         finish(&provider, response.status());
@@ -279,16 +295,15 @@ pub(crate) async fn run_chain(request: ChainRequest<'_>) -> Result<ChainSuccess,
         return match failure.response {
             FinalResponse::Relayed(response) => {
                 let status = response.status();
-                finish(&failure.provider, status);
+                finish(&failure.target.provider, status);
                 Ok(ChainSuccess {
                     status,
                     response,
-                    provider: failure.provider,
-                    model: failure.model,
+                    target: failure.target,
                 })
             }
             FinalResponse::MappedError { message, response } => {
-                finish(&failure.provider, response.status());
+                finish(&failure.target.provider, response.status());
                 Err(ForwardError::new(message, response))
             }
         };
@@ -360,16 +375,14 @@ enum FinalResponse {
 struct RememberedFailure {
     raw_status: StatusCode,
     response: FinalResponse,
-    provider: String,
-    model: String,
+    target: ServedTarget,
 }
 
 fn remember_failure(
     remembered: &mut Option<RememberedFailure>,
     raw_status: StatusCode,
     response: FinalResponse,
-    provider: String,
-    model: String,
+    target: ServedTarget,
 ) {
     if remembered
         .as_ref()
@@ -380,8 +393,7 @@ fn remember_failure(
     *remembered = Some(RememberedFailure {
         raw_status,
         response,
-        provider,
-        model,
+        target,
     });
 }
 
@@ -395,6 +407,7 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{log_before_headers_advance, log_error_advance};
+    use crate::{accounts::UpstreamSkips, proxy::failover::record_refusal};
 
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -491,5 +504,63 @@ mod tests {
             logs.contains("upstream_message=\"zzdistinctzz\""),
             "got: {logs}"
         );
+    }
+
+    /// A recorded refusal logs one warning naming the upstream, the refusal
+    /// kind, and when its skip window ends, and starts that window (#817).
+    #[test]
+    fn a_recorded_refusal_logs_one_warning_with_its_kind_and_expiry() {
+        let skips = UpstreamSkips::default();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let logs = capture(|| {
+            record_refusal(
+                Some(&skips),
+                "primary",
+                "model-a",
+                StatusCode::BAD_REQUEST,
+                "spend_limit",
+                std::time::Duration::from_secs(600),
+            );
+        });
+
+        assert_eq!(logs.matches("WARN").count(), 1, "got: {logs}");
+        for field in ["provider=primary", "model=model-a", "status=400"] {
+            assert!(logs.contains(field), "missing {field}; got: {logs}");
+        }
+        assert!(logs.contains("refusal=\"spend_limit\""), "got: {logs}");
+        let until: u64 = logs
+            .split("skip_until_epoch_secs=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no expiry field; got: {logs}"));
+        assert!(
+            (before + 600..=before + 601).contains(&until),
+            "expiry {until} is not 600 s after {before}"
+        );
+        assert!(skips.is_skipped("primary"));
+    }
+
+    /// The positive twin: a passthrough refusal still logs once, but records no
+    /// window and states no expiry.
+    #[test]
+    fn a_passthrough_refusal_logs_once_and_records_no_window() {
+        let logs = capture(|| {
+            record_refusal(
+                None,
+                "primary",
+                "model-a",
+                StatusCode::PAYMENT_REQUIRED,
+                "billing",
+                std::time::Duration::from_secs(600),
+            );
+        });
+
+        assert_eq!(logs.matches("WARN").count(), 1, "got: {logs}");
+        assert!(logs.contains("refusal=\"billing\""), "got: {logs}");
+        assert!(!logs.contains("skip_until_epoch_secs"), "got: {logs}");
     }
 }

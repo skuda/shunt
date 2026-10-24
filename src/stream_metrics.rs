@@ -4,7 +4,11 @@
 //! chunk as soon as it is polled, and incrementally inspects complete SSE frames.
 //! Parsing is capped at 256 KiB per event; oversized events are ignored until
 //! their boundary while forwarding continues unchanged. Token accounting is
-//! intentionally streaming-only in this first version.
+//! intentionally streaming-only in this first version; spend metering
+//! ([`spend_tap`]) also reads a served non-streamed body, through a bounded
+//! tee that forwards it unchanged.
+
+mod spend_tap;
 
 use std::{
     pin::Pin,
@@ -18,6 +22,10 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
+
+pub(crate) use spend_tap::SpendTap;
+
+use crate::client_attribution::ClientAttribution;
 
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 
@@ -162,6 +170,10 @@ struct ObserverState {
     // routed provider).
     provider: std::sync::Arc<std::sync::Mutex<String>>,
     model: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The `client_kind`/`managed` pair every per-request series carries
+    /// (`docs/otlp-client-attribution.md`), captured from the inbound request
+    /// before the stream was wrapped.
+    attribution: ClientAttribution,
     started_at: Instant,
     // The upstream response status the stream opened with. `finish` gates
     // `record_stream_failure` on this being 2xx: a non-2xx SSE response was
@@ -189,6 +201,9 @@ struct ObserverState {
     skipping_oversized: bool,
     skip_tail: [u8; 4],
     skip_tail_len: usize,
+    /// The end of the oversized frame being skipped, kept so a Responses
+    /// terminal's usage can still be read (see [`spend_tap::OversizedTail`]).
+    oversized: Option<spend_tap::OversizedTail>,
     terminal_seen: bool,
     error_seen: bool,
     /// Set once the [`UPSTREAM_TRUNCATED_MARKER`] frame is observed; forces
@@ -211,6 +226,9 @@ struct ObserverState {
     /// frame, recorded alongside the `shunt.ttft` histogram.
     ttft_ms: Option<u64>,
     tokens: TokenUsage,
+    /// The served-response spend hook, billed once in `finish`. `None` for a
+    /// response nothing meters here.
+    spend: Option<spend_tap::StreamSpend>,
     finished: bool,
 }
 
@@ -220,6 +238,7 @@ impl ObserverState {
         status: StatusCode,
         provider: std::sync::Arc<std::sync::Mutex<String>>,
         model: std::sync::Arc<std::sync::Mutex<String>>,
+        attribution: ClientAttribution,
         started_at: Instant,
         span: tracing::Span,
     ) -> Self {
@@ -227,6 +246,7 @@ impl ObserverState {
             protocol,
             provider,
             model,
+            attribution,
             started_at,
             status,
             span,
@@ -235,6 +255,7 @@ impl ObserverState {
             skipping_oversized: false,
             skip_tail: [0; 4],
             skip_tail_len: 0,
+            oversized: None,
             terminal_seen: false,
             error_seen: false,
             truncated_seen: false,
@@ -244,6 +265,7 @@ impl ObserverState {
             last_event_len: 0,
             ttft_ms: None,
             tokens: TokenUsage::default(),
+            spend: None,
             finished: false,
         }
     }
@@ -263,6 +285,7 @@ impl ObserverState {
         crate::metrics::record_ttft(
             &self.provider.lock().expect("provider slot"),
             &self.model.lock().expect("model slot"),
+            self.attribution,
             ttft.as_secs_f64() * 1000.0,
         );
         self.ttft_ms = Some(millis(ttft));
@@ -272,6 +295,15 @@ impl ObserverState {
         while !bytes.is_empty() {
             if self.skipping_oversized {
                 let consumed = self.skip_to_boundary(bytes);
+                if let Some(tail) = self.oversized.as_mut() {
+                    tail.push(&bytes[..consumed]);
+                }
+                if !self.skipping_oversized {
+                    if let (Some(spend), Some(tail)) = (self.spend.as_mut(), self.oversized.take())
+                    {
+                        spend.observe_oversized(&tail);
+                    }
+                }
                 bytes = &bytes[consumed..];
                 continue;
             }
@@ -291,6 +323,9 @@ impl ObserverState {
     fn parse_complete_frames(&mut self) {
         while let Some((boundary, delimiter_len)) = find_boundary(&self.buffer) {
             let end = boundary + delimiter_len;
+            if let Some(spend) = self.spend.as_mut() {
+                spend.observe_frame(&self.buffer[..boundary]);
+            }
             let (observation, event) = observe_frame(self.protocol, &self.buffer[..boundary]);
             // Copied out before anything else touches `self`: `event` borrows
             // the buffer this loop is about to drain.
@@ -324,6 +359,10 @@ impl ObserverState {
                 self.record_ttft();
             }
         }
+        self.oversized = self
+            .spend
+            .as_ref()
+            .and_then(|spend| spend.begin_oversized(&self.buffer));
         self.buffer.clear();
         self.skipping_oversized = true;
     }
@@ -418,10 +457,25 @@ impl ObserverState {
             return;
         }
         self.finished = true;
+        if let Some(mut spend) = self.spend.take() {
+            // A last block with no closing blank line still reached the
+            // client on a clean EOF: the WebSocket relay serves it then
+            // (`BoundedSseFrameBuffer::finish`), so its usage is billed too.
+            // On a body error the relay returns without serving it.
+            if matches!(end, StreamEnd::Eof) {
+                if let Some(tail) = self.oversized.take() {
+                    spend.observe_oversized(&tail);
+                } else if !self.buffer.is_empty() {
+                    spend.observe_frame(&self.buffer);
+                }
+            }
+            spend.settle(self.status);
+        }
         let outcome = self.outcome(end.natural());
         crate::metrics::record_stream_outcome(
             &self.provider.lock().expect("provider slot"),
             &self.model.lock().expect("model slot"),
+            self.attribution,
             outcome.as_str(),
         );
         // Only a stream that actually opened `200` can have "failed mid-stream"
@@ -450,6 +504,7 @@ impl ObserverState {
                 crate::metrics::record_stream_tokens(
                     &self.provider.lock().expect("provider slot"),
                     &self.model.lock().expect("model slot"),
+                    self.attribution,
                     kind,
                     count,
                 );
@@ -677,6 +732,7 @@ pub fn observe_response(
     protocol: Protocol,
     provider: String,
     model: String,
+    attribution: ClientAttribution,
     started_at: Instant,
 ) -> Response<Body> {
     observe_response_with_slot(
@@ -684,6 +740,7 @@ pub fn observe_response(
         protocol,
         std::sync::Arc::new(std::sync::Mutex::new(provider)),
         std::sync::Arc::new(std::sync::Mutex::new(model)),
+        attribution,
         started_at,
     )
 }
@@ -696,10 +753,48 @@ pub fn observe_response_with_slot(
     protocol: Protocol,
     provider: std::sync::Arc<std::sync::Mutex<String>>,
     model: std::sync::Arc<std::sync::Mutex<String>>,
+    attribution: ClientAttribution,
     started_at: Instant,
 ) -> Response<Body> {
+    observe_served(
+        response,
+        protocol,
+        provider,
+        model,
+        attribution,
+        started_at,
+        None,
+    )
+}
+
+/// [`observe_response_with_slot`] plus the served-response spend hook. With a
+/// tap, an SSE body is billed from the frames the observer reads, and any
+/// other body passes through a bounded tee that bills its `usage` at the end;
+/// either way the bytes the client receives are untouched. `spend: None` is
+/// how a caller that meters the turn itself (a gated capture) switches the
+/// hook off.
+pub(crate) fn observe_served(
+    response: Response<Body>,
+    protocol: Protocol,
+    provider: std::sync::Arc<std::sync::Mutex<String>>,
+    model: std::sync::Arc<std::sync::Mutex<String>>,
+    attribution: ClientAttribution,
+    started_at: Instant,
+    spend: Option<SpendTap>,
+) -> Response<Body> {
     if !is_sse(&response) {
-        return response;
+        let Some(tap) = spend else {
+            return response;
+        };
+        let status = response.status();
+        let truncated = response.extensions().get::<UpstreamTruncated>().is_some();
+        let (parts, body) = response.into_parts();
+        let body = Body::new(
+            spend_tap::JsonSpendBody::new(body, tap, status)
+                .protocol(protocol)
+                .truncated(truncated),
+        );
+        return Response::from_parts(parts, body);
     }
     let status = response.status();
     // Captured here, synchronously inside the caller's `.instrument(span)`
@@ -709,9 +804,19 @@ pub fn observe_response_with_slot(
     // no longer find it. See `crate::observability`'s module docs.
     let span = tracing::Span::current();
     let (parts, body) = response.into_parts();
+    let mut state = ObserverState::new(
+        protocol,
+        status,
+        provider,
+        model,
+        attribution,
+        started_at,
+        span,
+    );
+    state.spend = spend.map(|tap| spend_tap::StreamSpend::for_protocol(tap, protocol));
     let observed = ObservedStream {
         upstream: body.into_data_stream().boxed(),
-        state: ObserverState::new(protocol, status, provider, model, started_at, span),
+        state,
     };
     Response::from_parts(parts, Body::from_stream(observed))
 }
@@ -736,19 +841,22 @@ pub(crate) fn content_type_is_event_stream(value: &axum::http::HeaderValue) -> b
 }
 
 fn find_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
-        (None, None) => None,
+    // One forward pass over the `\n` bytes: the first one that completes either
+    // delimiter is the earliest boundary (`\n\n` starts at it, `\r\n\r\n` one
+    // byte before it, and the two cannot both complete at the same `\n`), so
+    // the scan stops at the boundary and never walks the rest of the buffer.
+    let mut from = 0;
+    while let Some(offset) = bytes[from..].iter().position(|&byte| byte == b'\n') {
+        let at = from + offset;
+        if bytes.get(at + 1) == Some(&b'\n') {
+            return Some((at, 2));
+        }
+        if at >= 1 && bytes[at - 1] == b'\r' && bytes.get(at + 1..at + 3) == Some(b"\r\n") {
+            return Some((at - 1, 4));
+        }
+        from = at + 1;
     }
+    None
 }
 
 /// Parse a complete frame's `event:` and `data:` field values under the SSE

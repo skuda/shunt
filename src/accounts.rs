@@ -15,10 +15,12 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::config::{AccountConfig, PoolConfig};
 
 mod request_stats;
+mod upstream_skip;
 
 pub use request_stats::AttemptOutcome;
 pub(crate) use request_stats::CountAttempt;
 use request_stats::RequestStats;
+pub(crate) use upstream_skip::UpstreamSkips;
 
 /// Credential-store namespace. Stable account ids only coalesce inside their
 /// own store family, so a Claude UUID can never collide with a ChatGPT account id.
@@ -29,6 +31,7 @@ pub enum StoreFamily {
     Chatgpt,
     Kimi,
     Antigravity,
+    Xai,
 }
 
 /// Stable physical-account identity used by every runtime state map.
@@ -642,6 +645,10 @@ pub struct AccountPool {
     /// not one per provider), so this override is too. `None` defers to the
     /// config file's own value; memory-only, cleared on restart.
     sort_by_reset_override: Mutex<Option<bool>>,
+    /// Skip windows for `api_key` upstreams that refused the account
+    /// (issue #817). Lives here because the pool is the process-lifetime state
+    /// every `AppState` snapshot shares across reloads; memory-only.
+    upstream_skips: UpstreamSkips,
 }
 
 /// Why one account is not selectable for this request.
@@ -752,6 +759,11 @@ impl Drop for ReprobeReservation {
 impl AccountPool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The per-upstream skip windows that account-level refusals start.
+    pub(crate) fn upstream_skips(&self) -> &UpstreamSkips {
+        &self.upstream_skips
     }
 
     /// Synchronize the upstream's current configured identities before an
@@ -1583,18 +1595,18 @@ impl AccountPool {
         self.mark_dirty();
     }
 
-    /// Apply one successfully polled Antigravity `retrieveUserQuotaSummary` response.
-    /// Google's response is a full authoritative snapshot on every call, so the
-    /// buckets wholesale replace whatever the previous tick recorded — no
-    /// partial-window reconciliation like Claude's per-window
+    /// Apply one successfully polled set of named quota buckets: Antigravity's
+    /// `retrieveUserQuotaSummary`, or the Grok CLI proxy's billing for an xAI
+    /// account. Each response is a full authoritative snapshot on every call,
+    /// so the buckets wholesale replace whatever the previous tick recorded —
+    /// no partial-window reconciliation like Claude's per-window
     /// overwrite-if-present or Codex's clear-flags dance.
     ///
     /// Display-only on purpose: this leaves `health.quota` (5h/7d/aggregate
-    /// status) untouched and records no utilization metric, so Antigravity
-    /// pool selection/rotation behavior is unchanged (it already ignores quota
-    /// for this family) — matching the `/admin/observed` display-only
-    /// precedent.
-    pub fn note_antigravity_usage(
+    /// status) untouched and records no utilization metric, so pool
+    /// selection/rotation behavior is unchanged (both families already ignore
+    /// quota) — matching the `/admin/observed` display-only precedent.
+    pub fn note_quota_buckets(
         &self,
         provider: &str,
         account: &AccountConfig,
@@ -1675,20 +1687,62 @@ impl AccountPool {
         reason: &'static str,
         scope: CooldownScope,
     ) {
+        let _ = self.set_cooldown(provider, account, duration, reason, scope, false);
+    }
+
+    /// [`Self::cooldown_scoped`] for an account-wide refusal that states its own
+    /// resume time: a window already running is never shortened, so a later,
+    /// shorter refusal on the same account leaves the longer deadline standing.
+    /// Returns the time left on the deadline that stands, which may exceed
+    /// `duration`.
+    pub fn cooldown_refusal(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        duration: Duration,
+        reason: &'static str,
+    ) -> Duration {
+        self.set_cooldown(
+            provider,
+            account,
+            duration,
+            reason,
+            CooldownScope::Account,
+            true,
+        )
+    }
+
+    fn set_cooldown(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        duration: Duration,
+        reason: &'static str,
+        scope: CooldownScope,
+        keep_longer: bool,
+    ) -> Duration {
         let mut entries = self.entries.lock().expect("account health lock poisoned");
         let health = self.health_entry(&mut entries, account_key(provider, account));
         health.observed = true;
         health.enabled = !account.disabled;
-        match scope {
-            CooldownScope::Account => health.cooldown_until = Some(Instant::now() + duration),
-            CooldownScope::Fable => health.cooldown_until_fable = Some(Instant::now() + duration),
-        }
+        let now = Instant::now();
+        let until = now + duration;
+        let slot = match scope {
+            CooldownScope::Account => &mut health.cooldown_until,
+            CooldownScope::Fable => &mut health.cooldown_until_fable,
+        };
+        let standing = match (keep_longer, *slot) {
+            (true, Some(running)) => running.max(until),
+            _ => until,
+        };
+        *slot = Some(standing);
         // Any failover-worthy failure restarts the storm-control ramp: when the
         // account comes back it re-enters slow start instead of inheriting the
         // allowance it had grown before failing.
         health.ramp_allowance = 0;
         drop(entries);
         crate::metrics::record_pool_rotation(provider, reason);
+        standing.saturating_duration_since(now)
     }
 
     /// Cool down one `(account, model)` pair: selection for `model` treats the
@@ -2946,7 +3000,9 @@ pub(crate) fn account_key(upstream: &str, account: &AccountConfig) -> AccountKey
         // Claude. Kimi is matched before the Claude fallback because it would
         // otherwise be keyed as a Claude account and could collide with a
         // real Claude account of the same name — note `kimi-code`, the
-        // preset's own name, does *not* contain `codex`.
+        // preset's own name, does *not* contain `codex`. An unstamped account on
+        // the built-in xAI `grok` provider lands on Claude here; every xAI caller
+        // goes through `resolve_pool_accounts`, which stamps `StoreFamily::Xai`.
         let lower = upstream.to_lowercase();
         if lower.contains("codex") || lower.contains("chatgpt") {
             StoreFamily::Chatgpt
@@ -3458,6 +3514,15 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Seconds since the Unix epoch at `lasts` from now, for the `*_until_epoch_secs`
+/// log fields. A clock before the epoch reads as 0.
+pub(crate) fn epoch_secs_after(lasts: Duration) -> u64 {
+    (SystemTime::now() + lasts)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
 fn record_pool_utilization(provider: &str, utilization: [Option<f64>; 3]) {
     for (window, value) in ["5h", "7d", "7d_oi"].into_iter().zip(utilization) {
         crate::metrics::record_pool_utilization(provider, window, value);
@@ -3827,6 +3892,34 @@ pub fn classify_codex(status: StatusCode, _headers: &HeaderMap) -> FailoverActio
         return FailoverAction::Rotate;
     }
     FailoverAction::Relay
+}
+
+/// Classify an xAI subscription OAuth (Grok CLI proxy) upstream response for
+/// account-pool failover. Takes the same `(status, headers)` shape as
+/// [`classify_codex`], which it extends: 401 and 402 rotate too.
+///
+/// - 401: like the Kimi pool, a rejected bearer cools down and rotates instead
+///   of a same-account refresh retry. The pool also marks the account's file
+///   for a forced refresh (`auth::force_xai_refresh`), so its next use after
+///   the cooldown refreshes rather than resending the rejected token until its
+///   JWT `exp`.
+/// - 402: a payment/entitlement refusal is account-specific and persistent,
+///   the Kimi membership case ([`classify_kimi`]).
+/// - 403 relays, as in every other classifier. xAI's documented tier gate
+///   surfaces at token refresh, where a failed credential resolution already
+///   cools the account down and rotates; an inference 403 can be a
+///   content-policy refusal, and re-sending it to every pool account could
+///   get all of them flagged.
+///
+/// Never returns `RefreshRetry` or `PauseSame`.
+pub fn classify_xai(status: StatusCode, headers: &HeaderMap) -> FailoverAction {
+    if matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::PAYMENT_REQUIRED
+    ) {
+        return FailoverAction::Rotate;
+    }
+    classify_codex(status, headers)
 }
 
 /// How long a Codex pool account stays skipped for one model after the
@@ -5089,6 +5182,86 @@ mod tests {
             rotation_reason(StatusCode::BAD_GATEWAY, &HeaderMap::new()),
             "server_error"
         );
+    }
+
+    #[test]
+    fn classify_xai_rotates_auth_membership_quota_and_server_errors() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            classify_xai(StatusCode::OK, &headers),
+            FailoverAction::Relay
+        );
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                classify_xai(status, &headers),
+                FailoverAction::Rotate,
+                "{status} must rotate"
+            );
+        }
+        // 403 relays: an inference 403 can be a content-policy refusal, and
+        // the tier gate is handled at token refresh instead.
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            assert_eq!(
+                classify_xai(status, &headers),
+                FailoverAction::Relay,
+                "{status} must relay"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_xai_never_asks_for_a_refresh_retry_or_a_pause() {
+        for code in 100..=599 {
+            let Ok(status) = StatusCode::from_u16(code) else {
+                continue;
+            };
+            let action = classify_xai(status, &HeaderMap::new());
+            assert!(
+                !matches!(
+                    action,
+                    FailoverAction::RefreshRetry | FailoverAction::PauseSame
+                ),
+                "{code} returned {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_classifier_relays_a_403() {
+        let headers = HeaderMap::new();
+        for (name, action) in [
+            ("classify", classify(StatusCode::FORBIDDEN, &headers)),
+            (
+                "classify_codex",
+                classify_codex(StatusCode::FORBIDDEN, &headers),
+            ),
+            (
+                "classify_kimi",
+                classify_kimi(StatusCode::FORBIDDEN, &headers),
+            ),
+            (
+                "classify_antigravity",
+                classify_antigravity(StatusCode::FORBIDDEN, &headers),
+            ),
+            (
+                "classify_xai",
+                classify_xai(StatusCode::FORBIDDEN, &headers),
+            ),
+        ] {
+            assert_eq!(action, FailoverAction::Relay, "{name} must relay a 403");
+        }
     }
 
     #[test]
@@ -6793,6 +6966,30 @@ mod tests {
                 "account-wide cooldown must defer {model}"
             );
         }
+    }
+
+    #[test]
+    fn refusal_cooldown_keeps_the_longer_window() {
+        let pool = AccountPool::new();
+        let account = account("a");
+        let remaining = || {
+            pool.snapshot("anthropic", std::slice::from_ref(&account), None, None)[0]
+                .cooldown_secs_remaining
+                .expect("cooling")
+        };
+        pool.cooldown_refusal("anthropic", &account, Duration::from_secs(1000), "refusal");
+        let standing =
+            pool.cooldown_refusal("anthropic", &account, Duration::from_secs(100), "refusal");
+        assert!(
+            standing > Duration::from_secs(900),
+            "the returned window is the one that stands"
+        );
+        assert!(
+            remaining() > 900,
+            "a shorter refusal must not shorten the window"
+        );
+        pool.cooldown_refusal("anthropic", &account, Duration::from_secs(5000), "refusal");
+        assert!(remaining() > 4900, "a longer refusal extends the window");
     }
 
     #[test]
@@ -8669,7 +8866,7 @@ mod tests {
         let sibling = account("agy-sibling");
         pool.sync_enabled_accounts(provider, &[target.clone(), sibling.clone()]);
 
-        pool.note_antigravity_usage(
+        pool.note_quota_buckets(
             provider,
             &target,
             vec![
@@ -8703,7 +8900,7 @@ mod tests {
 
         // A second poll fully replaces the first bucket list — Google's
         // response is authoritative each call, so nothing merges.
-        pool.note_antigravity_usage(
+        pool.note_quota_buckets(
             provider,
             &target,
             vec![QuotaBucketSnapshot {

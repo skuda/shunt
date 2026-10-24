@@ -25,6 +25,16 @@ shunt run
 
 このオプトインにより、Codex CLI のモデル検出も解析可能になります。`GET /models` と `GET /backend-api/codex/models` は有効なフォールバック `{"models":[]}` を返します。共有の `GET /v1/models` パスでは、`client_version` クエリフィールドが Anthropic 風のヘッダーより優先され、Codex 形式を選択します。このフィールドがなければ、既存の Anthropic 検出レスポンスは変わりません。これらのリクエストは通常のモデル検出認証ゲートを通り、shunt は不完全な Codex モデル行を生成しません。
 
+## Web 検索
+
+Codex CLI の組み込み Web 検索ツール（`web.run`）は、`/responses` を付けるのと同じ base URL の `{base_url}/alpha/search` へ POST します。shunt は base URL の各形式についてこのパスを登録します。
+
+- `POST /backend-api/codex/alpha/search`
+- `POST /alpha/search`
+- `POST /v1/alpha/search`
+
+検索は Responses のターンと同じ `[server.auth]` ポリシーと同じ ChatGPT/Codex アカウントプール（セッション固定の選択、フェイルオーバー、リフレッシュ）を使い、リクエストボディとレスポンスをバックエンドの `/codex/alpha/search` へそのまま中継します。検索はモデルのターンではないため `[[server.codex_endpoint.routes]]` は適用されず、常に `[server.codex_endpoint].provider` へ送られます。これらのルートは `POST` のみを受け付けます。このツールには WebSocket 形式がありません。
+
 ## クライアント analytics のシンク
 
 Codex CLI は base URL へプロダクト analytics も POST します。shunt は CLI が生成しうる両方のパスを受け付けます。
@@ -160,9 +170,31 @@ shunt は Codex CLI のディスカバリー要求に対して有効なフォー
 - **ヘッダーの許可リスト。** 新しい許可リストは、まずクライアントから `content-type`（なければ `application/json`）と `accept` だけを引き継ぎ、解決された資格情報と、ルーティング先のアップストリーム自身が要求するヘッダーを加えます。具体的には、xAI/Grok では省略する `OpenAI-Beta: responses=experimental`、`xai_oauth` ルートの Grok CLI identity ヘッダー一式、そして `api_key` ルートの送信先が正確に `api.openai.com` で、空でない conversation id が解決された場合に新しく生成する 4 つのセッションアフィニティヘッダー（`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id`）です。クライアントが送った `authorization`、`x-api-key`、`chatgpt-account-id`、`originator`、`version`、`user-agent`、`session-id`、`thread-id`、`x-client-request-id`、`x-codex-*`、`x-shunt-*` は引き続き削除され、純正 OpenAI 向けの値も転送ではなく生成されます。xAI とその他のサードパーティ OpenAI 互換ホストにはセッションアフィニティヘッダーを追加しません。API キーパスは `accept: text/event-stream` も生成しません。
 - **ボディの `model` 書き換え。** `upstream_model` が要求されたモデルと異なる場合、shunt はトップレベルの `model` だけを書き換え、他のフィールドはそのまま残します。JSON オブジェクトでないボディはそのまま送らず `400` で拒否します。
 - **identity エンコーディング。** zstd のリクエストボディはまずデコードされ(純正の Responses API はそのエンコーディングを受け付けません)、`content-encoding` は転送されません。
-- **資格情報は 1 つ、フェイルオーバーなし。** ルーティング先のサードパーティの背後にプールはないため、429 や 5xx はローテーションを起こさず `retry-after` とともにそのままリレーされます。
+- **資格情報は 1 つ、フェイルオーバーなし。** ルーティング先のサードパーティの背後にフェイルオーバー用のプールはないため、429 や 5xx はローテーションを起こさず `retry-after` とともにそのままリレーされます。プールを考慮する唯一の例外は名前付きアカウントを持つ `xai_oauth` ルートです。このルートもリクエストを 1 回だけ送り（アップストリームの失敗はローテーションせずリレー）、資格情報はプール選択順でログインを読み込める最初のアカウントになります（プロバイダーの `account`/`accounts` スコープが適用されます）。ログインを読み込めないアカウントはクールダウンされ、スキップされます。名前付きアカウントがない場合は `~/.shunt/xai-auth.json` です。
 
 マッチングは完全一致で大文字小文字を区別し、文字種の制限もありません。そのため `MiniMax-M3`、`openai/gpt-5.6-sol`、`~openai/gpt-latest` といったベンダーのスラッグも書いたとおりにルーティングされます。別の `chatgpt_oauth` プロバイダーへのルートであれば、プールのパススルーがそのまま維持されます。ルートはライブ設定から読まれるため、リロードで反映されます。
+
+## 支出上限
+
+[`[server.spend]`](/ja/reference/configuration/#serverspendオプション)を設定すると、このエンドポイントも `/v1/messages` と同じプリンシパル単位の上限をチェックし、計測します。設定しない場合、以下は適用されません。完全な動作は [Gateway spend limits](https://github.com/pleaseai/shunt/blob/main/docs/gateway-spend-limits.md)（英語）を参照してください。
+
+- **チェックの時点。** すべてのターンは、アップストリームを呼ぶ前にチェックされます。3 つの Responses パスの HTTP `POST` と Responses WebSocket の両方が対象です。プリンシパルは静的な `[server.auth]` トークン名、検証済み JWT のメール、または `[server.auth]` がオフのときの匿名プリンシパルです。このエンドポイントは gateway ログインセッションを受け付けません。
+- **拒否レスポンス。** 上限を超えたターンには `429` と `{"error":{"message":…,"type":"usage_limit_reached","code":"usage_limit_reached","resets_at":<エポック秒>}}` が返り、`retry-after`、`x-should-retry: false`、`x-codex-promo-message: <blocked_message>` ヘッダーが付きます。promo ヘッダーは `blocked_message` が純粋な ASCII の場合にのみ送られ、テキストは常にメッセージにも含まれます。名前が挙がる上限は、到達した上限のうち最後にリセットされるものです。`fail_closed_on_error` が有効なとき、支出状態を確認できない上限付きプリンシパルは同じ type で拒否され、`resets_at` と `retry-after` はありません。
+- **Codex CLI の表示。** 固定バージョン `rust-v0.159.3` では、Codex CLI はこのエラーを再試行しません。`resets_at` から独自の文面（"You've hit your usage limit … Try again at"）を表示し、ヘッダーがあれば promo メッセージも表示して、サーバーのメッセージは無視します。これは Codex CLI の動作であり、他のバージョンでは異なる可能性があります。
+- **WebSocket。** 拒否された `response.create` には、同じエラーと `retry-after`、`x-codex-promo-message` を載せた `{"type":"error","status":429,"error":{…},"headers":{…}}` フレームが 1 つ返ります。ソケットは開いたままで、以降の各ターンは改めてチェックされ、`generate: false` のウォームアップはチェックされません。
+- **Web 検索。** `/alpha/search` とそのエイリアスは、上限を超えていると拒否され、計測されません。
+- **計測。** 完了したターンは Responses の `usage` から課金され、`/v1/messages` が書き込むのと同じカウンターに加算されるため、1 つの上限が両方のサーフェスを制限します。キャッシュされたトークンはキャッシュ読み取りレート、残りの入力は入力レートで課金され、推論トークンは出力に含まれ、キャッシュ書き込みはありません。使用量が報告されずに終わったターン（クライアントの切断、置き換えられたターン、途切れたストリーム）は、リクエスト本文から推定した入力に配信済みの出力を加えた下限で課金されます。ストリーミングでない 2xx の JSON 本文も、同様に `usage` から課金されます。入力が報告されていない本文は、代わりに推定した入力で課金されます。
+- **GPT の価格。** 組み込みの料金表には GPT/Codex の価格がないため、これらのモデルは行を追加するまで不明モデルのレート（100 万トークンあたり `$5 / $25 / $0.50 / $6.25`、モデルごとに警告 1 回）で課金されます。
+
+```toml
+[[server.spend.pricing.overrides]]
+upstream = "codex"       # エンドポイントの provider
+model = "gpt-6.1-sol"
+input = 1.00             # 例のレート、100 万トークンあたり USD
+output = 8.00
+cache_read = 0.10
+cache_write = 1.00
+```
 
 ## `/v1/messages` との違い
 
