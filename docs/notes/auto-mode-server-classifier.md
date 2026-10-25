@@ -101,8 +101,8 @@ shunt wraps gets `identity` instead
 (`thinking_wrap::request_identity_encoding`). A response in an unsupported or
 stacked coding stays on the passthrough path. Codec steps
 run under bounded blocking-pool admission and emit decoded pieces of at most
-16 KiB. The zstd decoder fails a frame that needs a window above 8 MiB, the
-limit RFC 9659 sets for the "zstd" content coding. `Decoder` uses flate2's gzip wrapper and drains pending output before
+16 KiB. The zstd decoder does not allocate a window buffer above 8 MiB, the
+largest window RFC 9659 lets a "zstd" content-coding encoder require. `Decoder` uses flate2's gzip wrapper and drains pending output before
 requesting more input. At a member boundary, it starts a fresh gzip decoder
 when input remains or arrives later. A malformed or truncated coding body
 raises a body-stream error. See

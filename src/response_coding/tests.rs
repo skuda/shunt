@@ -182,7 +182,7 @@ async fn invalid_and_truncated_bodies_error_without_panicking() {
 }
 
 #[tokio::test]
-async fn zstd_frames_needing_more_than_an_8_mib_window_fail() {
+async fn zstd_frames_of_unknown_size_needing_more_than_an_8_mib_window_fail() {
     use std::io::Write as _;
     let frame = |window_log: u32| {
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
