@@ -173,6 +173,9 @@ pub(super) async fn finish(
             if let Some(coding) = turn.coding {
                 response.extensions_mut().insert(coding);
             }
+            if let Some(first_party) = turn.first_party {
+                response.extensions_mut().insert(first_party);
+            }
             // The retained bytes are served whole, so the length is the
             // body's own; an upstream length describing a different encoding
             // of the same turn would contradict them.

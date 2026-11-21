@@ -92,6 +92,9 @@ pub(crate) struct RetainedTurn {
     /// stamped when the verdict is known.
     pub headers: HeaderMap,
     pub coding: Option<crate::response_coding::UpstreamCoding>,
+    /// Carried to the replay so its safeguard synthesis logs a first-party
+    /// hole as the live turn would have.
+    pub first_party: Option<crate::proxy::safeguards::FirstPartyRelay>,
     /// The rendered bytes the caller would have received live.
     pub body: Bytes,
     pub streaming: bool,
@@ -538,6 +541,10 @@ async fn retain_stream(
             .extensions
             .get::<crate::response_coding::UpstreamCoding>()
             .copied(),
+        first_party: parts
+            .extensions
+            .get::<crate::proxy::safeguards::FirstPartyRelay>()
+            .copied(),
         body: Bytes::from(retained),
         streaming: true,
         provider,
@@ -579,6 +586,10 @@ async fn retain_message(
         coding: parts
             .extensions
             .get::<crate::response_coding::UpstreamCoding>()
+            .copied(),
+        first_party: parts
+            .extensions
+            .get::<crate::proxy::safeguards::FirstPartyRelay>()
             .copied(),
         body: Bytes::from(retained),
         streaming: false,

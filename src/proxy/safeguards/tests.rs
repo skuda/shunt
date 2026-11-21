@@ -6,7 +6,10 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 
-use super::{requested_types, synthesize, transform_stream, MAX_FRAME_BYTES, MIN_SYNTHESIS_BYTES};
+use super::{
+    requested_types, synthesize, synthesize_for_chain, transform_stream, FirstParty,
+    FirstPartyRelay, HoleReport, MAX_FRAME_BYTES, MIN_SYNTHESIS_BYTES,
+};
 
 type Item = Result<Bytes, std::convert::Infallible>;
 
@@ -21,7 +24,8 @@ fn types() -> Vec<String> {
 }
 
 async fn relay(chunks: Vec<Item>) -> String {
-    let out: Vec<_> = transform_stream(stream::iter(chunks), types())
+    let report = HoleReport::new(FirstParty::Marked(false));
+    let out: Vec<_> = transform_stream(stream::iter(chunks), types(), report)
         .collect()
         .await;
     out.into_iter()
@@ -271,4 +275,162 @@ async fn a_lowered_inbound_limit_does_not_disable_synthesis() {
         json!({"toolu_c": {"type": "unavailable", "reason": "error"}}),
         "a 4-byte inbound limit must not suppress the response-side answer"
     );
+}
+
+/// Capture the formatted log output for the rest of the test. The tests run on
+/// tokio's current-thread runtime, so the thread-local default covers every
+/// poll of the relayed body.
+fn capture_logs() -> (
+    tracing::subscriber::DefaultGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Writer(Arc::clone(&writer_output)))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    (tracing::subscriber::set_default(subscriber), output)
+}
+
+fn logged(output: &std::sync::Mutex<Vec<u8>>) -> String {
+    String::from_utf8(output.lock().unwrap().clone()).unwrap()
+}
+
+fn first_party(mut response: Response) -> Response {
+    response.extensions_mut().insert(FirstPartyRelay);
+    response
+}
+
+const TOOL_START: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"Bash\"}}\n\n";
+
+const FIRST_PARTY_HOLE: &str = "a first-party upstream answered";
+
+#[tokio::test]
+async fn a_first_party_stream_hole_warns_under_the_request_span() {
+    use tracing::Instrument;
+
+    let (_guard, output) = capture_logs();
+    let body = format!("{TOOL_START}{DELTA}");
+    let span = tracing::info_span!("proxy_request", session_id = "session-1");
+    let response = synthesize(first_party(sse_response(&body)), &types(), LIMIT)
+        .instrument(span)
+        .await;
+    // Read outside the span, as hyper reads a relayed body after the handler
+    // returned.
+    let relayed = body_string(response).await;
+
+    assert_eq!(
+        message_delta(&relayed)["delta"]["safeguard_results"][0]["status"]["tool_uses"],
+        json!({"toolu_a": {"type": "unavailable", "reason": "error"}}),
+        "the hole is still filled"
+    );
+    let logs = logged(&output);
+    let line = logs
+        .lines()
+        .find(|line| line.contains(FIRST_PARTY_HOLE))
+        .unwrap_or_else(|| panic!("no first-party warning in:\n{logs}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("session-1"), "{line}");
+    assert!(line.contains("streaming=true"), "{line}");
+    assert!(line.contains("tool_uses=1"), "{line}");
+}
+
+#[tokio::test]
+async fn a_first_party_json_hole_warns() {
+    let (_guard, output) = capture_logs();
+    let body = r#"{"type":"message","content":[{"type":"tool_use","id":"toolu_b"}]}"#;
+    let response = synthesize(
+        first_party(json_response(StatusCode::OK, body)),
+        &types(),
+        LIMIT,
+    )
+    .await;
+    let value: Value = serde_json::from_str(&body_string(response).await).unwrap();
+
+    assert!(
+        value.get("safeguard_results").is_some(),
+        "the hole is still filled"
+    );
+    let logs = logged(&output);
+    let line = logs
+        .lines()
+        .find(|line| line.contains(FIRST_PARTY_HOLE))
+        .unwrap_or_else(|| panic!("no first-party warning in:\n{logs}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("streaming=false"), "{line}");
+    assert!(line.contains("tool_uses=1"), "{line}");
+}
+
+#[tokio::test]
+async fn a_translated_hole_does_not_warn() {
+    let (_guard, output) = capture_logs();
+    let body = format!("{TOOL_START}{DELTA}");
+    let relayed = body_string(synthesize(sse_response(&body), &types(), LIMIT).await).await;
+
+    assert!(message_delta(&relayed)["delta"]
+        .get("safeguard_results")
+        .is_some());
+    assert_eq!(
+        logged(&output),
+        "",
+        "a translated route fills holes every turn"
+    );
+}
+
+#[tokio::test]
+async fn a_first_party_verdict_does_not_warn() {
+    let (_guard, output) = capture_logs();
+    let delta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"safeguard_results\":[{\"type\":\"dangerous_tool_use\",\"status\":{\"type\":\"available\",\"tool_uses\":{\"toolu_a\":{\"type\":\"evaluated\",\"outcome\":\"not_flagged\"}}}}]}}\n\n";
+    let body = format!("{TOOL_START}{delta}");
+    let relayed =
+        body_string(synthesize(first_party(sse_response(&body)), &types(), LIMIT).await).await;
+
+    assert_eq!(relayed, body);
+    assert_eq!(logged(&output), "");
+}
+
+#[tokio::test]
+async fn a_chain_won_by_a_first_party_upstream_warns() {
+    let (_guard, output) = capture_logs();
+    let body = format!("{TOOL_START}{DELTA}");
+    let response = synthesize_for_chain(sse_response(&body), &types(), LIMIT, || true).await;
+    let relayed = body_string(response).await;
+
+    assert!(message_delta(&relayed)["delta"]
+        .get("safeguard_results")
+        .is_some());
+    let logs = logged(&output);
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("WARN") && line.contains(FIRST_PARTY_HOLE)),
+        "no first-party warning in:\n{logs}"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_won_by_a_translated_upstream_does_not_warn() {
+    let (_guard, output) = capture_logs();
+    let body = format!("{TOOL_START}{DELTA}");
+    let response = synthesize_for_chain(sse_response(&body), &types(), LIMIT, || false).await;
+    let relayed = body_string(response).await;
+
+    assert!(message_delta(&relayed)["delta"]
+        .get("safeguard_results")
+        .is_some());
+    assert_eq!(logged(&output), "");
 }

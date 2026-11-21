@@ -46,6 +46,13 @@ pub(crate) fn effective_upstream_model(
         .map_or_else(|| route.upstream_model.clone(), str::to_string)
 }
 
+/// Whether this adapter sends the request's auto-mode `safeguards` field to
+/// `provider` rather than stripping it: true for a `base_url` whose host is
+/// `api.anthropic.com`.
+pub(crate) fn keeps_safeguards(provider: &crate::config::ProviderConfig) -> bool {
+    safeguards::is_first_party(&provider.base_url)
+}
+
 pub struct AnthropicAdapter;
 
 impl Adapter for AnthropicAdapter {
@@ -1264,15 +1271,18 @@ async fn relay_response(
     // wrapped. Only a successful JSON (or untyped) body is
     // read whole to be rewritten: an error body, or one declared as any other
     // type, carries no thinking block, so it keeps streaming through.
-    let signing_key = state
-        .config
-        .provider(&route.provider)
-        .and_then(thinking_wrap::signing_key);
+    let provider = state.config.provider(&route.provider);
+    let signing_key = provider.and_then(thinking_wrap::signing_key);
     let wrap_buffered = signing_key.is_some() && status.is_success() && is_json;
 
     let mut builder = Response::builder().status(status);
     if let Some(coding) = coding {
         builder = builder.extension(coding);
+    }
+    // This provider kept the request's `safeguards` field, so the response-side
+    // synthesis reports a missing answer as the upstream's omission.
+    if provider.is_some_and(keeps_safeguards) {
+        builder = builder.extension(crate::proxy::safeguards::FirstPartyRelay);
     }
     for (name, value) in response_headers {
         if let Some(name) = name {

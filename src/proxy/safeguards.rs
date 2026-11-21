@@ -28,6 +28,12 @@
 //! forwarded verbatim — this never rewrites an upstream verdict, it only fills
 //! a hole.
 //!
+//! A hole in a response from an upstream that kept the request's `safeguards`
+//! field — a response marked [`FirstPartyRelay`], or a committed chain won by
+//! such an upstream ([`synthesize_for_chain`]) — is filled the same way, but
+//! logged at `warn`: its missing answer is the upstream's omission, not a
+//! translation gap.
+//!
 //! See `docs/notes/auto-mode-server-classifier.md` for the measured wire
 //! protocol.
 
@@ -38,6 +44,11 @@ use axum::{
 };
 use futures_util::{stream, Stream, StreamExt};
 use serde_json::{json, Map, Value};
+
+mod report;
+
+pub(crate) use report::FirstPartyRelay;
+use report::{FirstParty, HoleReport};
 
 /// Largest SSE frame this pass parses. A real `message_delta` is a few hundred
 /// bytes; anything past this bound is forwarded unmodified rather than
@@ -69,13 +80,49 @@ pub(crate) async fn synthesize(
     types: &[String],
     max_body_bytes: usize,
 ) -> Response {
+    let marked = response.extensions().get::<FirstPartyRelay>().is_some();
+    synthesize_reported(response, types, max_body_bytes, FirstParty::Marked(marked)).await
+}
+
+/// [`synthesize`] for a committed chain's response, which is built before any
+/// upstream wins and so carries no [`FirstPartyRelay`].
+/// `winner_kept_safeguards` is asked, when a hole is filled, whether the
+/// winning upstream kept the request's `safeguards` field.
+pub(crate) async fn synthesize_for_chain(
+    response: Response,
+    types: &[String],
+    max_body_bytes: usize,
+    winner_kept_safeguards: impl Fn() -> bool + Send + Sync + 'static,
+) -> Response {
+    synthesize_reported(
+        response,
+        types,
+        max_body_bytes,
+        FirstParty::Winner(Box::new(winner_kept_safeguards)),
+    )
+    .await
+}
+
+async fn synthesize_reported(
+    response: Response,
+    types: &[String],
+    max_body_bytes: usize,
+    first_party: FirstParty,
+) -> Response {
     if types.is_empty() || !response.status().is_success() {
         return response;
     }
+    let report = HoleReport::new(first_party);
     match essence(&response).as_deref() {
-        Some("text/event-stream") => wrap_stream(response, types),
+        Some("text/event-stream") => wrap_stream(response, types, report),
         Some("application/json") => {
-            inject_json(response, types, max_body_bytes.max(MIN_SYNTHESIS_BYTES)).await
+            inject_json(
+                response,
+                types,
+                max_body_bytes.max(MIN_SYNTHESIS_BYTES),
+                &report,
+            )
+            .await
         }
         _ => response,
     }
@@ -109,9 +156,9 @@ fn essence(response: &Response) -> Option<String> {
         })
 }
 
-fn wrap_stream(response: Response, types: &[String]) -> Response {
+fn wrap_stream(response: Response, types: &[String], report: HoleReport) -> Response {
     let (parts, body) = response.into_parts();
-    let stream = transform_stream(body.into_data_stream(), types.to_vec());
+    let stream = transform_stream(body.into_data_stream(), types.to_vec(), report);
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
@@ -127,14 +174,16 @@ struct FrameState {
     /// its head was already flushed: its tail is not a frame of its own and
     /// must not be parsed.
     oversized: bool,
+    report: HoleReport,
 }
 
 impl FrameState {
-    fn new() -> Self {
+    fn new(report: HoleReport) -> Self {
         Self {
             carry: Vec::new(),
             tool_ids: Vec::new(),
             oversized: false,
+            report,
         }
     }
 
@@ -158,10 +207,7 @@ impl FrameState {
                 .and_then(|frame| rewrite_frame(frame, &mut self.tool_ids, types))
             {
                 Some(rewritten) => {
-                    tracing::debug!(
-                        tool_uses = self.tool_ids.len(),
-                        "synthesized safeguard_results on a relayed message_delta"
-                    );
+                    self.report.filled(true, self.tool_ids.len());
                     out.extend_from_slice(rewritten.as_bytes());
                 }
                 None => out.extend_from_slice(frame),
@@ -178,12 +224,13 @@ impl FrameState {
 fn transform_stream<S, E>(
     upstream: S,
     types: Vec<String>,
+    report: HoleReport,
 ) -> impl Stream<Item = Result<Bytes, E>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    let state = (Box::pin(upstream), FrameState::new(), types, false);
+    let state = (Box::pin(upstream), FrameState::new(report), types, false);
     stream::unfold(state, |(mut upstream, mut state, types, done)| {
         Box::pin(async move {
             if done {
@@ -334,7 +381,12 @@ fn record_tool_use(value: &Value, tool_ids: &mut Vec<String>) {
 /// `stream` flag said. A JSON reply is not a stream: it has no frames to
 /// forward incrementally, and the field cannot be inserted without the whole
 /// body. A body past `max_body_bytes` is forwarded unmodified instead.
-async fn inject_json(response: Response, types: &[String], max_body_bytes: usize) -> Response {
+async fn inject_json(
+    response: Response,
+    types: &[String],
+    max_body_bytes: usize,
+    report: &HoleReport,
+) -> Response {
     let (mut parts, body) = response.into_parts();
     let mut data = body.into_data_stream();
     let mut collected: Vec<Bytes> = Vec::new();
@@ -371,22 +423,20 @@ async fn inject_json(response: Response, types: &[String], max_body_bytes: usize
         }
     }
     let raw = collected.concat();
-    let Some(injected) = inject_message_body(&raw, types) else {
+    let Some((injected, tool_uses)) = inject_message_body(&raw, types) else {
         return Response::from_parts(parts, Body::from(raw));
     };
-    tracing::debug!(
-        bytes = injected.len(),
-        "synthesized safeguard_results on a relayed non-streaming message"
-    );
+    report.filled(false, tool_uses);
     // The body grew; the relayed length no longer describes it.
     parts.headers.remove(CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(injected))
 }
 
-/// Insert `safeguard_results` into a non-streaming Messages body. `None` — the
-/// caller forwards the original bytes — for a non-JSON body, a body that is not
-/// a `message`, or one that already answered.
-fn inject_message_body(raw: &[u8], types: &[String]) -> Option<Bytes> {
+/// Insert `safeguard_results` into a non-streaming Messages body, returning the
+/// new body and the number of `tool_use` ids read from `content`. `None` — the caller
+/// forwards the original bytes — for a non-JSON body, a body that is not a
+/// `message`, or one that already answered.
+fn inject_message_body(raw: &[u8], types: &[String]) -> Option<(Bytes, usize)> {
     let mut value = serde_json::from_slice::<Value>(raw).ok()?;
     let object = value.as_object_mut()?;
     if object.get("type").and_then(Value::as_str) != Some("message")
@@ -410,7 +460,9 @@ fn inject_message_body(raw: &[u8], types: &[String]) -> Option<Bytes> {
         "safeguard_results".to_string(),
         results_value(types, &tool_ids),
     );
-    serde_json::to_vec(&value).ok().map(Bytes::from)
+    serde_json::to_vec(&value)
+        .ok()
+        .map(|body| (Bytes::from(body), tool_ids.len()))
 }
 
 /// One `safeguard_results` entry per requested type, each reporting every
