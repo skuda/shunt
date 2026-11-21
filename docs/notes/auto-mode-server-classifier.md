@@ -145,6 +145,22 @@ the field in where responses leave the inbound Messages surface — the
 The synthesized value reports every observed tool use as
 `{"type": "unavailable", "reason": "error"}` under a status-level `available`.
 
+**First-party holes.** A provider whose `base_url` host is
+`api.anthropic.com` keeps the request's `safeguards` field
+(`adapters::anthropic::keeps_safeguards`), so a hole in its response is the
+upstream's omission. The synthesis fills it like any other hole and logs a
+`warn` line that starts with `a first-party upstream answered`, with the fields
+`streaming` and `tool_uses`. The Anthropic adapter's `relay_response` marks
+such a response with `FirstPartyRelay`, and the gated router's replay keeps
+the mark. The committed mixed chain (`src/proxy/chain_stream.rs`) builds its
+response before an upstream wins, so it checks its winner slot against the
+same predicate when the hole is filled (`synthesize_for_chain`). The line is
+emitted under the span that was current when the synthesis was set up, which
+is the request span of the `proxied request` line. A relayed stream is read
+after the handler returned, so the stream path names that span as the event's
+parent explicitly. A hole from another upstream, the normal case on a
+translated route, is logged at `debug`.
+
 **Why not status-level `disabled`.** Read against the table above, a
 status-level `unavailable` is as bad as sending nothing: both retire the server
 classifier for the whole session, and every later action in that session is

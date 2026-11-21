@@ -501,6 +501,20 @@ pub(super) async fn forward_chain_stream(
     // the stream observer's — carries the turn's attribution.
     let attribution = body.attribution();
     let max_request_bytes = state.config.server.limits.max_request_bytes;
+    // The chain's providers that keep the request's `safeguards` field: a
+    // missing answer in a stream one of them won is that upstream's omission,
+    // which the synthesis below logs at `warn`.
+    let keeps_safeguards: std::collections::HashSet<String> = routes
+        .iter()
+        .filter(|route| route.adapter == AdapterKind::Anthropic)
+        .filter(|route| {
+            state
+                .config
+                .provider(&route.provider)
+                .is_some_and(crate::adapters::anthropic::keeps_safeguards)
+        })
+        .map(|route| route.provider.clone())
+        .collect();
     let first_route = routes
         .first()
         .expect("route chains are non-empty after resolution");
@@ -977,9 +991,20 @@ pub(super) async fn forward_chain_stream(
         )))
         .expect("response builder uses valid status and headers")
         .into_response();
-    let response =
-        crate::proxy::safeguards::synthesize(response, &requested_safeguards, max_request_bytes)
-            .await;
+    // The winner slot names the committed upstream before its first frame goes
+    // out, so it is current by the time the `message_delta` arrives.
+    let winner = winner_slot.clone();
+    let response = crate::proxy::safeguards::synthesize_for_chain(
+        response,
+        &requested_safeguards,
+        max_request_bytes,
+        move || {
+            winner
+                .lock()
+                .is_ok_and(|winner| keeps_safeguards.contains(winner.as_str()))
+        },
+    )
+    .await;
     let mut response = if observe_stream {
         stream_metrics::observe_served(
             response,
